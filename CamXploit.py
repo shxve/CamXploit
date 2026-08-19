@@ -488,8 +488,13 @@ def probe_rtsp(ip, port):
     common RTSP verbs (via Public: header or the response body). This is
     stricter than the previous "any RTSP/1.0 substring anywhere" check, which
     could match on binary junk from unrelated services.
+
+    Uses a 3s timeout (vs. PORT_SCAN_TIMEOUT=1.5s for the TCP-connect probe).
+    RTSP servers are often slower to respond than a bare TCP accept — under
+    the ~200-thread scan load a 1.5s window intermittently missed real RTSP
+    services on internet targets.
     """
-    data = _rtsp_request(ip, port, "OPTIONS", timeout=PORT_SCAN_TIMEOUT)
+    data = _rtsp_request(ip, port, "OPTIONS", timeout=3.0)
     if not data:
         return False
     # RTSP status line must be the very first thing on the wire.
@@ -684,8 +689,14 @@ def check_if_camera(ip, open_ports, rtsp_ports=None):
 
     def analyze_port(port):
         nonlocal camera_indicators
-        if port in rtsp_ports:
-            print(f"\n  🔍 Port {port}: RTSP detected — skipping HTTP analysis.")
+        # Skip HTTP analysis on ports we know speak RTSP — either because the
+        # port-scan probe positively identified them, or because they're in
+        # the static PORT_SERVICE_MAP as RTSP (belt-and-braces: probe_rtsp can
+        # time out under scan load on internet targets, and we don't want to
+        # spam "Connection Error" for that).
+        static_svc = PORT_SERVICE_MAP.get(port, ("", ""))[0].upper()
+        if port in rtsp_ports or static_svc.startswith("RTSP"):
+            print(f"\n  🔍 Port {port}: RTSP — skipping HTTP analysis.")
             return
         protocol = get_protocol(port, ip)
         base_url = f"{protocol}://{ip}:{port}"
