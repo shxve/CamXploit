@@ -618,8 +618,15 @@ def check_ports(ip, additional_ports=None):
     print(f"\n{Y}[📊] Scan completed: {scanned_count} ports checked, {len(open_ports)} ports open{W}")
     return sorted(open_ports), sorted(rtsp_ports)
 
-def check_if_camera(ip, open_ports):
-    """Enhanced camera detection with detailed port analysis"""
+def check_if_camera(ip, open_ports, rtsp_ports=None):
+    """Enhanced camera detection with detailed port analysis.
+
+    `rtsp_ports` (from check_ports) lets us skip HTTP analysis on ports we
+    already know speak RTSP — a Dahua RTSP server on 554 will close a plain
+    HTTP GET, producing a noisy "Connection Error" that doesn't tell the
+    operator anything they don't already know.
+    """
+    rtsp_ports = set(rtsp_ports or [])
     print(f"\n{C}[📷] Analyzing Ports for Camera Indicators:{W}")
     camera_indicators = False
     
@@ -677,6 +684,9 @@ def check_if_camera(ip, open_ports):
 
     def analyze_port(port):
         nonlocal camera_indicators
+        if port in rtsp_ports:
+            print(f"\n  🔍 Port {port}: RTSP detected — skipping HTTP analysis.")
+            return
         protocol = get_protocol(port, ip)
         base_url = f"{protocol}://{ip}:{port}"
 
@@ -939,6 +949,11 @@ def test_default_passwords(ip, open_ports, rtsp_ports=None):
     lock = threading.Lock()
     tested_count = [0]
     successes = []
+    # (status_code, body_len, has_set_cookie) for the unauthenticated response
+    # on each URL. Keyed by URL, populated on first probe.
+    probe_cache = {}
+    probe_lock = threading.Lock()
+    skipped_urls = set()   # URLs where credential testing is meaningless
 
     def _time_left():
         return MAX_CREDENTIAL_TEST_TIME - (time.time() - start_time)
@@ -950,6 +965,23 @@ def test_default_passwords(ip, open_ports, rtsp_ports=None):
                 print(f"  📊 Tested {tested_count[0]} credentials... "
                       f"({int(time.time() - start_time)}s elapsed) [{kind} {label}]")
 
+    def _probe_unauth(url):
+        """Fetch `url` once without credentials. Return (status, len, set_cookie)
+        or None on error. Cached per URL — first caller pays the round-trip."""
+        with probe_lock:
+            if url in probe_cache:
+                return probe_cache[url]
+        try:
+            r = SESSION.get(url, timeout=CREDENTIAL_TIMEOUT,
+                            verify=False, allow_redirects=False)
+            headers_lower = {k.lower() for k in r.headers.keys()}
+            result = (r.status_code, len(r.content), 'set-cookie' in headers_lower)
+        except (requests.exceptions.RequestException, Exception):
+            result = None
+        with probe_lock:
+            probe_cache[url] = result
+        return result
+
     def _rtsp_task(port, username, password):
         if found_event.is_set() or _time_left() <= 0 or not threads_running:
             return None
@@ -959,24 +991,58 @@ def test_default_passwords(ip, open_ports, rtsp_ports=None):
         return None
 
     def _http_task(port, path, auth_type, username, password):
+        """Test one HTTP credential against a URL.
+
+        Guards against the "any 200 is success" false positive: we first probe
+        the URL without credentials. For basic-auth endpoints we insist the
+        unauth response be 401/403 (otherwise no auth is enforced and creds
+        mean nothing). For form-auth we look at whether the credentialed POST
+        response *differs* meaningfully from the unauth GET — a session cookie
+        appearing or a redirect landing indicate a real login, whereas a
+        matching 200 just means the login form re-rendered.
+        """
         if found_event.is_set() or _time_left() <= 0 or not threads_running:
             return None
-        _bump("HTTP", port)
         protocol = get_protocol(port, ip)
         url = f"{protocol}://{ip}:{port}{path}"
+
+        probe = _probe_unauth(url)
+        if probe is None:
+            return None
+        unauth_status, _unauth_len, unauth_setcookie = probe
+
+        if auth_type == "basic":
+            if unauth_status not in (401, 403):
+                # No auth is enforced here — testing creds is pointless.
+                with probe_lock:
+                    skipped_urls.add(url)
+                return None
+        # For form auth we still try, but validation below is stricter than
+        # "any 200 counts."
+
+        _bump("HTTP", port)
         try:
             if auth_type == "basic":
                 response = SESSION.get(url, auth=(username, password),
                                        timeout=CREDENTIAL_TIMEOUT, verify=False,
                                        allow_redirects=False)
+                # Success = unauth was gated (asserted above) and auth got 200.
+                if response.status_code == 200:
+                    return ("http", port, url, username, password)
             elif auth_type == "form":
-                response = SESSION.post(url, data={'username': username, 'password': password},
+                response = SESSION.post(url,
+                                        data={'username': username, 'password': password},
                                         timeout=CREDENTIAL_TIMEOUT, verify=False,
                                         allow_redirects=False)
-            else:
-                return None
-            if response.status_code == 200:
-                return ("http", port, url, username, password)
+                headers_lower = {k.lower() for k in response.headers.keys()}
+                new_setcookie = 'set-cookie' in headers_lower
+                # Real form login: server issues a session cookie, or redirects
+                # away from the login page. A bare 200 (login form re-rendered)
+                # is not sufficient — that's how we got false positives before.
+                if response.status_code in (301, 302, 303, 307, 308):
+                    return ("http", port, url, username, password)
+                if new_setcookie and not unauth_setcookie:
+                    return ("http", port, url, username, password)
         except (requests.exceptions.RequestException, Exception):
             pass
         return None
@@ -1037,6 +1103,12 @@ def test_default_passwords(ip, open_ports, rtsp_ports=None):
         print(f"{Y}[⚠️] Credential testing stopped after {MAX_CREDENTIAL_TEST_TIME}s timeout{W}")
     else:
         print(f"{C}[✓] Tested {tested_count[0]} credentials in {elapsed}s{W}")
+
+    if skipped_urls:
+        print(f"{C}[ℹ️] Skipped credential testing on {len(skipped_urls)} URL(s) that "
+              f"returned 200 unauthenticated — no auth is enforced there:{W}")
+        for u in sorted(skipped_urls):
+            print(f"     · {u}")
 
     if successes:
         for kind, port, url, user, pw in successes:
@@ -1480,7 +1552,14 @@ def detect_live_streams(ip, open_ports, rtsp_ports=None):
         return False
 
     def _check_rtsp_stream(url):
-        """RTSP stream check. Sends DESCRIBE; 200 or 401 both prove the path exists."""
+        """RTSP stream check.
+
+        Only reports a per-path hit when DESCRIBE returns 200. A 401 tells us
+        only that an RTSP server exists on this port — which is true for every
+        path, so reporting it per URL just spams the operator with URLs that
+        are unlikely to exist (the "RTSP Ports Found" preamble already tells
+        them to use VLC with a suggested URL and their creds).
+        """
         m = re.match(r"rtsp://([^:/]+):(\d+)(/.*)?$", url)
         if not m:
             return False
@@ -1489,11 +1568,8 @@ def detect_live_streams(ip, open_ports, rtsp_ports=None):
             resp = _rtsp_request(host, int(port_s), "DESCRIBE", path=path)
         except Exception:
             return False
-        status = _rtsp_status(resp)
-        if status in (200, 401):
-            print(f"  ✅ RTSP Stream Found: {url}  (status {status})")
-            if status == 401:
-                print(f"     🔐 Authentication required — supply credentials in VLC.")
+        if _rtsp_status(resp) == 200:
+            print(f"  ✅ RTSP Stream Found (unauthenticated): {url}")
             print(f"     🎯 Use VLC (Media -> Open Network Stream): {url}")
             return True
         return False
@@ -1669,7 +1745,7 @@ def main(argv=None):
             print("\n[✅] Scan Completed!")
             return 0
 
-        camera_found = check_if_camera(target_ip, open_ports)
+        camera_found = check_if_camera(target_ip, open_ports, rtsp_ports)
 
         if not camera_found and not skip_osint and not args.yes:
             try:
