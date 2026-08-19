@@ -18,10 +18,13 @@ from urllib3.exceptions import InsecureRequestWarning
 
 try:
     from defusedxml import ElementTree as ET  # type: ignore
+    from defusedxml.common import DefusedXmlException
     _XML_HARDENED = True
+    _XML_PARSE_ERRORS = (ET.ParseError, DefusedXmlException)
 except ImportError:
     from xml.etree import ElementTree as ET  # noqa: N813
     _XML_HARDENED = False
+    _XML_PARSE_ERRORS = (ET.ParseError,)
 
 # Suppress SSL warnings — the tool intentionally accepts self-signed camera certs
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
@@ -337,8 +340,9 @@ def get_ip_location_info(ip):
             print(f"  🏢 ISP: {data.get('org', 'N/A')}")
             
             # Location Information
-            if 'loc' in data:
-                lat, lon = data['loc'].split(',')
+            loc = data.get('loc', '')
+            if loc and ',' in loc:
+                lat, lon = loc.split(',', 1)
                 print(f"\n  📍 Coordinates:")
                 print(f"    Latitude: {lat}")
                 print(f"    Longitude: {lon}")
@@ -767,7 +771,7 @@ def check_if_camera(ip, open_ports, rtsp_ports=None):
                         # Note it, but do NOT flip camera_indicators — auth-
                         # required endpoints are true of many non-camera services.
                         print(f"    🔐 Auth-gated endpoint: {endpoint_url} (HTTP {code})")
-                except (requests.exceptions.RequestException, Exception):
+                except Exception:
                     continue
 
             # Print server information
@@ -829,7 +833,7 @@ def check_login_pages(ip, open_ports):
                                     allow_redirects=False)
             if response.status_code in (200, 401, 403):
                 return (url, response.status_code)
-        except (requests.exceptions.RequestException, Exception):
+        except Exception:
             pass
         return None
 
@@ -994,7 +998,7 @@ def test_default_passwords(ip, open_ports, rtsp_ports=None):
                             verify=False, allow_redirects=False)
             headers_lower = {k.lower() for k in r.headers.keys()}
             result = (r.status_code, len(r.content), 'set-cookie' in headers_lower)
-        except (requests.exceptions.RequestException, Exception):
+        except Exception:
             result = None
         with probe_lock:
             probe_cache[url] = result
@@ -1061,7 +1065,7 @@ def test_default_passwords(ip, open_ports, rtsp_ports=None):
                     return ("http", port, url, username, password)
                 if new_setcookie and not unauth_setcookie:
                     return ("http", port, url, username, password)
-        except (requests.exceptions.RequestException, Exception):
+        except Exception:
             pass
         return None
 
@@ -1156,7 +1160,7 @@ def try_default_credentials(ip, port):
                 response, _ = _capped_get(base, cap=1, auth=(username, password))
                 if response.status_code == 200:
                     return f"{username}:{password}"
-            except (requests.exceptions.RequestException, Exception):
+            except Exception:
                 pass
     return None
 
@@ -1195,7 +1199,7 @@ def fingerprint_camera(ip, open_ports):
             else:
                 print("❓ Unknown Camera Type")
                 fingerprint_generic(ip, port)
-        except (requests.exceptions.RequestException, Exception):
+        except Exception:
             print("❌ No response")
 
 def fingerprint_hikvision(ip, port):
@@ -1241,7 +1245,7 @@ def fingerprint_hikvision(ip, port):
                         print(f"🛡️ Firmware: {firmware}")
                     if not _XML_HARDENED:
                         print("    ℹ️  (Install `defusedxml` for hardened XML parsing.)")
-                except ET.ParseError:
+                except _XML_PARSE_ERRORS:
                     print("⚠️ Cannot parse XML configuration")
         except Exception as e:
             print(f"⚠️ {e}")
@@ -1357,7 +1361,7 @@ def fingerprint_generic(ip, port):
                 if detected_brand:
                     search_cve(detected_brand)
                     break  # Continue checking other endpoints
-        except (requests.exceptions.RequestException, Exception):
+        except Exception:
             pass
     if not detected_brand:
         print("❌ No common endpoints responded.")
@@ -1389,7 +1393,7 @@ def detect_camera_brand(ip, open_ports):
                 for brand, indicators in brand_indicators.items():
                     if any(ind in content or ind in url_lower for ind in indicators):
                         detected_brands.add(brand)
-        except (requests.exceptions.RequestException, Exception):
+        except Exception:
             continue
     
     return detected_brands
