@@ -44,6 +44,14 @@ CamXploit is intended for **security research, awareness, and authorized testing
 
 ---
 
+## 🆕 What's New in v2.2
+
+- **Complete OOM protection** — every fingerprint, brand-detection, and credential-check path now streams and size-caps the untrusted response body through one shared `_capped_get()` helper. Previously only two paths were capped, so a hostile camera could still hand the scanner an unbounded body via the other `.text`/`.content` reads.
+- **Clean exit without a target** — a piped or Colab run with no target argument now prints a clear message and exits, instead of dumping an `EOFError` traceback at the interactive prompt.
+- **Resilient worker phases** — the port scan, login-page probe, and credential batch now tolerate an unexpected worker error (that result is skipped) instead of letting it abort the phase, and `main()` has a top-level handler so any unexpected error ends the scan gracefully with a non-zero exit.
+- **Cleaner XML & OSINT handling** — `defusedxml`'s forbidden-entity rejections now surface as "cannot parse XML configuration" instead of a generic error, and a malformed ipinfo `loc` value no longer suppresses the rest of the location output.
+- **Housekeeping** — banner/User-Agent version strings corrected to 2.2; redundant `except` tuples simplified; the private-attribute body-buffer hack removed.
+
 ## 🆕 What's New in v2.1
 
 - **Command-line interface** — pass the target directly (`python CamXploit.py 1.2.3.4`) or as `IP:PORT`. Interactive prompt still works when no target is given.

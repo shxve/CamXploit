@@ -62,7 +62,7 @@ BANNER = rf"""
   {C}[🔍] Discover open CCTV cameras & security flaws
   {Y}[⚠️] For educational & security research purposes only!{W}
 
-  {B}VERSION{W}  = 2.1
+  {B}VERSION{W}  = 2.2
   {B}Made By{W}  = Spyboy
   {B}Twitter{W}  = https://spyboy.in/twitter
   {B}Discord{W}  = https://spyboy.in/Discord
@@ -237,7 +237,7 @@ DEFAULT_CREDENTIALS = {
 # runtime (see get_protocol / probe_tls).
 HTTPS_PORTS = {443, 8443, 8444, 9443, 4433, 7443}
 HEADERS = {
-    'User-Agent': 'CamXploit/2.1 (+https://github.com/spyboy-productions/CamXploit)'
+    'User-Agent': 'CamXploit/2.2 (+https://github.com/spyboy-productions/CamXploit)'
 }
 TIMEOUT = 5
 PORT_SCAN_TIMEOUT = 1.5
@@ -481,7 +481,7 @@ def _rtsp_request(ip, port, verb, path="/", headers=None, timeout=2.0):
     req = (
         f"{verb} rtsp://{ip}:{port}{path} RTSP/1.0\r\n"
         f"CSeq: 1\r\n"
-        f"User-Agent: CamXploit/2.1\r\n"
+        f"User-Agent: CamXploit/2.2\r\n"
         f"{hdr_lines}"
         f"\r\n"
     ).encode("ascii", errors="ignore")
