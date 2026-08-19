@@ -444,6 +444,31 @@ def get_protocol(port, ip=None):
         return "https"
     return "http"
 
+def _capped_get(url, cap=MAX_BODY_BYTES, **kwargs):
+    """GET `url` and return (response, body_text) with the body capped at `cap`
+    bytes.
+
+    The target device is untrusted: a plain ``requests.get`` eagerly downloads
+    the whole body into memory, so a hostile server can hand us an unbounded
+    response and OOM the scanner. This streams the body and stops at `cap`.
+    Session defaults (HEADERS, TIMEOUT, verify=False) are applied unless the
+    caller overrides them. Status code and headers remain readable on the
+    returned response after the body stream is closed.
+    """
+    kwargs.setdefault("headers", HEADERS)
+    kwargs.setdefault("timeout", TIMEOUT)
+    kwargs.setdefault("verify", False)
+    kwargs["stream"] = True
+    with SESSION.get(url, **kwargs) as resp:
+        buf = bytearray()
+        for chunk in resp.iter_content(chunk_size=8192):
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if len(buf) >= cap:
+                break
+        return resp, bytes(buf).decode("utf-8", errors="ignore")
+
 def _rtsp_request(ip, port, verb, path="/", headers=None, timeout=2.0):
     """Send one RTSP request and return the raw response bytes (or None)."""
     hdr_lines = ""
@@ -663,30 +688,6 @@ def check_if_camera(ip, open_ports, rtsp_ports=None):
         'application/json'
     ]
     
-    def _get_body_capped(url):
-        """GET a URL and return (response, body_text) with the body capped.
-
-        The camera is untrusted; without a cap a hostile server can hand us
-        an unbounded body and OOM the scanner.
-        """
-        with SESSION.get(url, headers=HEADERS, timeout=TIMEOUT,
-                          verify=False, stream=True) as resp:
-            buf = bytearray()
-            for chunk in resp.iter_content(chunk_size=8192):
-                if not chunk:
-                    break
-                buf.extend(chunk)
-                if len(buf) >= MAX_BODY_BYTES:
-                    break
-            try:
-                body = bytes(buf).decode('utf-8', errors='ignore')
-            except Exception:
-                body = ''
-            # Detach the (already-buffered) content so the caller can still
-            # inspect headers / status_code after the `with` closes.
-            resp._content = bytes(buf)
-            return resp, body
-
     def analyze_port(port):
         nonlocal camera_indicators
         # Skip HTTP analysis on ports we know speak RTSP — either because the
@@ -705,7 +706,7 @@ def check_if_camera(ip, open_ports, rtsp_ports=None):
 
         # Check server headers and response
         try:
-            response, body_text = _get_body_capped(base_url)
+            response, body_text = _capped_get(base_url)
             server_header = response.headers.get('Server', '').lower()
             content_type = response.headers.get('Content-Type', '').lower()
             
@@ -1143,8 +1144,7 @@ def try_default_credentials(ip, port):
     for username, passwords in DEFAULT_CREDENTIALS.items():
         for password in passwords:
             try:
-                response = SESSION.get(base, auth=(username, password),
-                                        headers=HEADERS, timeout=TIMEOUT, verify=False)
+                response, _ = _capped_get(base, cap=1, auth=(username, password))
                 if response.status_code == 200:
                     return f"{username}:{password}"
             except (requests.exceptions.RequestException, Exception):
@@ -1167,9 +1167,9 @@ def fingerprint_camera(ip, open_ports):
         url_base = f"{protocol}://{ip}:{port}"
         print(f"🔍 Checking {url_base}...")
         try:
-            resp = SESSION.get(url_base, headers=HEADERS, timeout=TIMEOUT, verify=False)
+            resp, body = _capped_get(url_base)
             server_header = resp.headers.get("server", "").lower()
-            content = resp.text.lower()
+            content = body.lower()
             
             if "hikvision" in server_header:
                 print("🔥 Hikvision Camera Detected!")
@@ -1243,10 +1243,10 @@ def fingerprint_dahua(ip, port):
     protocol = get_protocol(port, ip)
     try:
         url = f"{protocol}://{ip}:{port}/cgi-bin/magicBox.cgi?action=getSystemInfo"
-        resp = SESSION.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+        resp, body = _capped_get(url)
         if resp.status_code == 200:
             print(f"✅ Found at {url}")
-            print(resp.text.strip())
+            print(body.strip())
         else:
             print(f"❌ {url} -> HTTP {resp.status_code}")
     except Exception as e:
@@ -1258,10 +1258,10 @@ def fingerprint_axis(ip, port):
     protocol = get_protocol(port, ip)
     try:
         url = f"{protocol}://{ip}:{port}/axis-cgi/admin/param.cgi?action=list"
-        resp = SESSION.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+        resp, body = _capped_get(url)
         if resp.status_code == 200:
             print(f"✅ Found at {url}")
-            for line in resp.text.splitlines():
+            for line in body.splitlines():
                 if any(x in line for x in ["root.Brand", "root.Model", "root.Firmware"]):
                     print(f"🔹 {line.strip()}")
         else:
@@ -1287,10 +1287,10 @@ def fingerprint_cp_plus(ip, port):
     
     for url in endpoints:
         try:
-            resp = SESSION.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+            resp, body = _capped_get(url)
             if resp.status_code == 200:
                 print(f"✅ Found at {url}")
-                content = resp.text.lower()
+                content = body.lower()
                 
                 # Look for CP Plus specific information
                 if 'uvr-0401e1' in content or 'uvr0401e1' in content:
@@ -1301,7 +1301,7 @@ def fingerprint_cp_plus(ip, port):
                     print(f"📺 Device Type: DVR")
                 
                 # Print first 500 characters for analysis
-                print(f"📄 Response Preview: {resp.text[:500]}")
+                print(f"📄 Response Preview: {body[:500]}")
                 break
         except Exception as e:
             print(f"⚠️ {e}")
@@ -1334,13 +1334,13 @@ def fingerprint_generic(ip, port):
     for path in endpoints:
         url = f"{protocol}://{ip}:{port}{path}"
         try:
-            resp = SESSION.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+            resp, body = _capped_get(url)
             if resp.status_code == 200:
                 print(f"✅ Found at {url}")
-                snippet = resp.text[:500]
+                snippet = body[:500]
                 print(snippet)
                 # Try to detect brand in response text or headers
-                text = (resp.text + " " + str(resp.headers)).lower()
+                text = (body + " " + str(resp.headers)).lower()
                 for brand, keywords in brand_keywords.items():
                     if any(keyword in text for keyword in keywords):
                         detected_brand = brand
@@ -1370,10 +1370,10 @@ def detect_camera_brand(ip, open_ports):
         try:
             protocol = get_protocol(port, ip)
             url = f"{protocol}://{ip}:{port}/"
-            response = SESSION.get(url, headers=HEADERS, timeout=2, verify=False)
-            
+            response, body = _capped_get(url, timeout=2)
+
             if response.status_code == 200:
-                content = response.text.lower()
+                content = body.lower()
                 url_lower = url.lower()
                 
                 # Check for brand indicators
@@ -1705,7 +1705,12 @@ def main(argv=None):
         if args.target:
             user_input = args.target.strip()
         else:
-            user_input = input(f"{G}[+] {C}Enter IP address (or IP:PORT): {W}").strip()
+            try:
+                user_input = input(f"{G}[+] {C}Enter IP address (or IP:PORT): {W}").strip()
+            except EOFError:
+                print(f"\n{R}[!] No target provided and no interactive input available. "
+                      f"Pass the target on the command line (e.g. CamXploit.py 1.2.3.4).{W}")
+                return 2
 
         target_ip, specified_port = parse_ip_port(user_input)
         if target_ip is None:
