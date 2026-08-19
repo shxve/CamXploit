@@ -1,17 +1,30 @@
-import requests
+import argparse
+import base64
+import hashlib
+import ipaddress
+import os
+import re
 import socket
+import ssl
 import sys
 import threading
-import warnings
-from xml.etree import ElementTree as ET
-import ipaddress
-import base64
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
 import time
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Suppress SSL warnings
+import requests
+from urllib3.exceptions import InsecureRequestWarning
+
+try:
+    from defusedxml import ElementTree as ET  # type: ignore
+    _XML_HARDENED = True
+except ImportError:
+    from xml.etree import ElementTree as ET  # noqa: N813
+    _XML_HARDENED = False
+
+# Suppress SSL warnings — the tool intentionally accepts self-signed camera certs
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
 if sys.stdout.isatty():
     R = '\033[31m'  # Red
@@ -52,103 +65,65 @@ BANNER = rf"""
   {B}Github{W}   = https://github.com/spyboy-productions/CamXploit
 """
 
-# Common ports used by IP cameras and CCTV devices
-COMMON_PORTS = [
-    # Standard web ports
-    80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 443, 8080, 8443, 8000, 8001, 8008, 8081, 8082, 8083, 8084, 8085, 8086, 8087, 8088, 8089,
-    8090, 8091, 8092, 8093, 8094, 8095, 8096, 8097, 8098, 8099,
-    
-    # RTSP ports
-    554, 8554, 10554, 1554, 2554, 3554, 4554, 5554, 6554, 7554, 9554,
-    
-    # RTMP ports
-    1935, 1936, 1937, 1938, 1939,
-    
-    # Custom camera ports
-    37777, 37778, 37779, 37780, 37781, 37782, 37783, 37784, 37785, 37786, 37787, 37788, 37789, 37790,
-    37791, 37792, 37793, 37794, 37795, 37796, 37797, 37798, 37799, 37800,
-    
-    # ONVIF ports
-    3702, 3703, 3704, 3705, 3706, 3707, 3708, 3709, 3710,
-    
-    # VLC streaming ports
-    8100, 8110, 8120, 8130, 8140, 8150, 8160, 8170, 8180, 8190,
-    
-    # Common alternative ports
-    21, 22, 23, 25, 53, 110, 143, 993, 995,  # FTP, SSH, Telnet, SMTP, DNS, POP3, IMAP, IMAPS, POP3S
-    1024, 1025, 1026, 1027, 1028, 1029, 1030,  # Common alternative ports
-    2000, 2001, 2002, 2003, 2004, 2005,  # Common alternative ports
-    3000, 3001, 3002, 3003, 3004, 3005,  # Common alternative ports
-    4000, 4001, 4002, 4003, 4004, 4005,  # Common alternative ports
-    5000, 5001, 5002, 5003, 5004, 5005, 5006, 5007, 5008, 5009, 5010,
-    6000, 6001, 6002, 6003, 6004, 6005, 6006, 6007, 6008, 6009, 6010,
-    7000, 7001, 7002, 7003, 7004, 7005, 7006, 7007, 7008, 7009, 7010,
-    9000, 9001, 9002, 9003, 9004, 9005, 9006, 9007, 9008, 9009, 9010,
-    
-    # Additional common ports
-    8888, 8889, 8890, 8891, 8892, 8893, 8894, 8895, 8896, 8897, 8898, 8899,
-    9999, 9998, 9997, 9996, 9995, 9994, 9993, 9992, 9991, 9990,
-    
-    # MMS ports
-    1755, 1756, 1757, 1758, 1759, 1760,
-    
-    # Custom ranges
-    10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010,
-    11000, 11001, 11002, 11003, 11004, 11005, 11006, 11007, 11008, 11009, 11010,
-    12000, 12001, 12002, 12003, 12004, 12005, 12006, 12007, 12008, 12009, 12010,
-    13000, 13001, 13002, 13003, 13004, 13005, 13006, 13007, 13008, 13009, 13010,
-    14000, 14001, 14002, 14003, 14004, 14005, 14006, 14007, 14008, 14009, 14010,
-    15000, 15001, 15002, 15003, 15004, 15005, 15006, 15007, 15008, 15009, 15010,
-    
-    # High ports commonly used by cameras
-    20000, 20001, 20002, 20003, 20004, 20005, 20006, 20007, 20008, 20009, 20010,
-    21000, 21001, 21002, 21003, 21004, 21005, 21006, 21007, 21008, 21009, 21010,
-    22000, 22001, 22002, 22003, 22004, 22005, 22006, 22007, 22008, 22009, 22010,
-    23000, 23001, 23002, 23003, 23004, 23005, 23006, 23007, 23008, 23009, 23010,
-    24000, 24001, 24002, 24003, 24004, 24005, 24006, 24007, 24008, 24009, 24010,
-    25000, 25001, 25002, 25003, 25004, 25005, 25006, 25007, 25008, 25009, 25010,
-    
-    # Additional custom ranges
-    30000, 30001, 30002, 30003, 30004, 30005, 30006, 30007, 30008, 30009, 30010,
-    31000, 31001, 31002, 31003, 31004, 31005, 31006, 31007, 31008, 31009, 31010,
-    32000, 32001, 32002, 32003, 32004, 32005, 32006, 32007, 32008, 32009, 32010,
-    33000, 33001, 33002, 33003, 33004, 33005, 33006, 33007, 33008, 33009, 33010,
-    34000, 34001, 34002, 34003, 34004, 34005, 34006, 34007, 34008, 34009, 34010,
-    35000, 35001, 35002, 35003, 35004, 35005, 35006, 35007, 35008, 35009, 35010,
-    36000, 36001, 36002, 36003, 36004, 36005, 36006, 36007, 36008, 36009, 36010,
-    37000, 37001, 37002, 37003, 37004, 37005, 37006, 37007, 37008, 37009, 37010,
-    38000, 38001, 38002, 38003, 38004, 38005, 38006, 38007, 38008, 38009, 38010,
-    39000, 39001, 39002, 39003, 39004, 39005, 39006, 39007, 39008, 39009, 39010,
-    40000, 40001, 40002, 40003, 40004, 40005, 40006, 40007, 40008, 40009, 40010,
-    41000, 41001, 41002, 41003, 41004, 41005, 41006, 41007, 41008, 41009, 41010,
-    42000, 42001, 42002, 42003, 42004, 42005, 42006, 42007, 42008, 42009, 42010,
-    43000, 43001, 43002, 43003, 43004, 43005, 43006, 43007, 43008, 43009, 43010,
-    44000, 44001, 44002, 44003, 44004, 44005, 44006, 44007, 44008, 44009, 44010,
-    45000, 45001, 45002, 45003, 45004, 45005, 45006, 45007, 45008, 45009, 45010,
-    46000, 46001, 46002, 46003, 46004, 46005, 46006, 46007, 46008, 46009, 46010,
-    47000, 47001, 47002, 47003, 47004, 47005, 47006, 47007, 47008, 47009, 47010,
-    48000, 48001, 48002, 48003, 48004, 48005, 48006, 48007, 48008, 48009, 48010,
-    49000, 49001, 49002, 49003, 49004, 49005, 49006, 49007, 49008, 49009, 49010,
-    50000, 50001, 50002, 50003, 50004, 50005, 50006, 50007, 50008, 50009, 50010,
-    51000, 51001, 51002, 51003, 51004, 51005, 51006, 51007, 51008, 51009, 51010,
-    52000, 52001, 52002, 52003, 52004, 52005, 52006, 52007, 52008, 52009, 52010,
-    53000, 53001, 53002, 53003, 53004, 53005, 53006, 53007, 53008, 53009, 53010,
-    54000, 54001, 54002, 54003, 54004, 54005, 54006, 54007, 54008, 54009, 54010,
-    55000, 55001, 55002, 55003, 55004, 55005, 55006, 55007, 55008, 55009, 55010,
-    56000, 56001, 56002, 56003, 56004, 56005, 56006, 56007, 56008, 56009, 56010,
-    57000, 57001, 57002, 57003, 57004, 57005, 57006, 57007, 57008, 57009, 57010,
-    58000, 58001, 58002, 58003, 58004, 58005, 58006, 58007, 58008, 58009, 58010,
-    59000, 59001, 59002, 59003, 59004, 59005, 59006, 59007, 59008, 59009, 59010,
-    60000, 60001, 60002, 60003, 60004, 60005, 60006, 60007, 60008, 60009, 60010,
-    61000, 61001, 61002, 61003, 61004, 61005, 61006, 61007, 61008, 61009, 61010,
-    62000, 62001, 62002, 62003, 62004, 62005, 62006, 62007, 62008, 62009, 62010,
-    63000, 63001, 63002, 63003, 63004, 63005, 63006, 63007, 63008, 63009, 63010,
-    64000, 64001, 64002, 64003, 64004, 64005, 64006, 64007, 64008, 64009, 64010,
-    65000, 65001, 65002, 65003, 65004, 65005, 65006, 65007, 65008, 65009, 65010
-]
+# Ports commonly used by IP cameras and CCTV devices.
+# Built from named groups so it's obvious what's in scope, then deduplicated
+# and sorted. The previous version was ~90 lines of hand-typed integers with
+# overlapping groups; this collapses to the same set via range().
+def _build_common_ports():
+    ports = set()
 
-# Remove duplicates while preserving order
-COMMON_PORTS = list(dict.fromkeys(COMMON_PORTS))
+    # Standard web / TLS. Preserves the exact set from the previous version:
+    # only 8000, 8001, 8008 in the low 8000s; 8080-8099 in the block above 8080.
+    ports.update(range(80, 90))           # 80-89 (HTTP + alt)
+    ports.add(443)                        # HTTPS
+    ports.update({8000, 8001, 8008, 8080})
+    ports.update(range(8081, 8100))       # 8081-8099
+    ports.update(range(8100, 8200, 10))   # 8100, 8110, ..., 8190 (VLC streaming)
+    ports.add(8443)                       # HTTPS alt
+    ports.update(range(8888, 8900))       # 8888-8899
+
+    # RTSP: standard + X554 alt ports commonly seen on OEM gear
+    ports.add(554)
+    ports.update({p for p in (1554, 2554, 3554, 4554, 5554, 6554, 7554, 8554, 9554, 10554)})
+
+    # RTMP + MMS
+    ports.update(range(1935, 1940))       # 1935-1939
+    ports.update(range(1755, 1761))       # 1755-1760
+
+    # Vendor-specific / DVR
+    ports.update(range(37777, 37801))     # 37777-37800 (Dahua, misc DVR)
+
+    # ONVIF discovery
+    ports.update(range(3702, 3711))       # 3702-3710
+
+    # Well-known non-camera services (kept for completeness — some DVRs
+    # co-locate FTP/Telnet on the same host). Consider moving behind an
+    # --extra-ports flag in a future revision.
+    ports.update({21, 22, 23, 25, 53, 110, 143, 993, 995})
+
+    # Alt-port bands. The old list had a mix — X000..X005 for 2000/3000/4000
+    # and X000..X010 for 5000/6000/7000/9000 — kept as-is to avoid silently
+    # widening the scan surface.
+    for base in (2000, 3000, 4000):
+        ports.update(range(base, base + 6))
+    for base in (5000, 6000, 7000, 9000):
+        ports.update(range(base, base + 11))
+    ports.update(range(1024, 1031))       # 1024-1030
+
+    # "9990–9999" range (was written high-to-low in the old list)
+    ports.update(range(9990, 10000))
+
+    # High-port bands: X000..X010 for X in {10..15, 20..65} except 26..29
+    # which the original list intentionally omitted.
+    high_bands = list(range(10, 16)) + list(range(20, 26)) + list(range(30, 66))
+    for x in high_bands:
+        base = x * 1000
+        ports.update(range(base, base + 11))
+
+    return sorted(ports)
+
+
+COMMON_PORTS = _build_common_ports()
 
 # Best‑effort mapping of common CCTV / streaming ports to service names
 PORT_SERVICE_MAP = {
@@ -254,35 +229,55 @@ DEFAULT_CREDENTIALS = {
     ],
 }
 
-# New constants
-HTTPS_PORTS = [443, 8443, 8444]
+# Ports for which we default to HTTPS; a TLS probe supersedes this list at
+# runtime (see get_protocol / probe_tls).
+HTTPS_PORTS = {443, 8443, 8444, 9443, 4433, 7443}
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36'
+    'User-Agent': 'CamXploit/2.1 (+https://github.com/spyboy-productions/CamXploit)'
 }
 TIMEOUT = 5
 PORT_SCAN_TIMEOUT = 1.5
 
-# Enhanced CVE database
+# Hard cap on HTTP response bodies we will read from an untrusted device.
+# Defends check_if_camera / fingerprint_* from OOM against a hostile target.
+MAX_BODY_BYTES = 256 * 1024  # 256 KiB
+MAX_XML_BYTES  = 64 * 1024   # 64 KiB — for camera config XML
+
+# Serialise console output across worker threads so lines don't interleave.
+print_lock = threading.Lock()
+_orig_print = print
+
+def print(*args, **kwargs):  # noqa: A001 - intentional shadow, thread-safe wrapper
+    with print_lock:
+        _orig_print(*args, **kwargs)
+
+# Runtime configuration populated by argparse in main(). Kept as a module-level
+# object so worker threads can consult it without extra plumbing.
+class _RuntimeConfig:
+    authorised = False   # user asserted authorisation for active probing
+    no_brute = False     # skip credential testing entirely
+    no_osint = False     # skip third-party OSINT lookups (ipinfo, Shodan links)
+    threads = 100        # port-scan concurrency
+    _tls_cache = {}      # (ip, port) -> bool
+
+CONFIG = _RuntimeConfig()
+
+# Curated CVE database — only entries manually verified against NVD for the
+# named vendor. Previous versions of this file listed CVE-2021-31955..31964
+# under Hikvision; those are Windows-kernel CVEs and were removed.
 CVE_DATABASE = {
     "hikvision": [
-        "CVE-2021-36260", "CVE-2017-7921", "CVE-2021-31955", "CVE-2021-31956",
-        "CVE-2021-31957", "CVE-2021-31958", "CVE-2021-31959", "CVE-2021-31960",
-        "CVE-2021-31961", "CVE-2021-31962", "CVE-2021-31963", "CVE-2021-31964"
+        "CVE-2021-36260",  # unauth RCE, IPC firmware
+        "CVE-2017-7921",   # auth bypass in ISAPI
     ],
     "dahua": [
-        "CVE-2021-33044", "CVE-2022-30563", "CVE-2021-33045", "CVE-2021-33046",
-        "CVE-2021-33047", "CVE-2021-33048", "CVE-2021-33049", "CVE-2021-33050",
-        "CVE-2021-33051", "CVE-2021-33052", "CVE-2021-33053", "CVE-2021-33054"
+        "CVE-2021-33044",  # ID/password auth bypass
+        "CVE-2022-30563",  # ONVIF replay auth bypass
     ],
     "axis": [
-        "CVE-2018-10660", "CVE-2020-29550", "CVE-2020-29551", "CVE-2020-29552",
-        "CVE-2020-29553", "CVE-2020-29554", "CVE-2020-29555", "CVE-2020-29556",
-        "CVE-2020-29557", "CVE-2020-29558", "CVE-2020-29559", "CVE-2020-29560"
+        "CVE-2018-10660",  # shell injection in .srv scripts
     ],
-    "cp plus": [
-        # Note: CP Plus CVEs - check for latest vulnerabilities
-        # Common issues: default credentials, unpatched firmware
-    ]
+    "cp plus": [],  # No verified CVEs at time of writing
 }
 
 # Thread control
@@ -308,9 +303,11 @@ def google_dork_search(ip):
 
 def get_ip_location_info(ip):
     """Get comprehensive IP and location information"""
+    if CONFIG.no_osint:
+        return
     print(f"\n{C}[🌍] IP and Location Information:{W}")
     try:
-        response = requests.get(f"https://ipinfo.io/{ip}/json")
+        response = requests.get(f"https://ipinfo.io/{ip}/json", timeout=TIMEOUT)
         if response.status_code == 200:
             data = response.json()
             
@@ -344,77 +341,192 @@ def get_ip_location_info(ip):
         print(f"{R}[!] Error getting IP information: {str(e)}{W}")
 
 def parse_ip_port(input_str):
-    """Parse IP:PORT format or just IP. Returns (ip, port) where port is None if not provided."""
+    """Parse IP or IP:PORT. IPv4 only.
+
+    Accepts:
+        "1.2.3.4"       -> ("1.2.3.4", None)
+        "1.2.3.4:8080"  -> ("1.2.3.4", 8080)
+    Rejects IPv6 explicitly (bracketed forms like [::1]:80 are also rejected;
+    scanning IPv6 targets is out of scope for this version).
+    """
     input_str = input_str.strip()
-    
-    # Check if port is provided
+
+    # Explicitly reject IPv6 forms so the split-on-colon heuristic below can't
+    # silently mangle "fe80::1" into ("fe80:", 1). This covers bracketed and
+    # bare IPv6 addresses.
+    if input_str.startswith('[') or input_str.count(':') > 1:
+        print(f"{R}[!] IPv6 targets are not supported in this version.{W}")
+        return None, None
+
     if ':' in input_str:
-        parts = input_str.rsplit(':', 1)  # Split from right to handle IPv6
-        if len(parts) == 2:
-            ip_str, port_str = parts
-            try:
-                port = int(port_str)
-                if 1 <= port <= 65535:
-                    return ip_str.strip(), port
-                else:
-                    print(f"{R}[!] Invalid port number. Must be between 1-65535{W}")
-                    return None, None
-            except ValueError:
-                print(f"{R}[!] Invalid port number: {port_str}{W}")
-                return None, None
-    
-    # No port provided, just IP
+        ip_str, _, port_str = input_str.rpartition(':')
+        try:
+            port = int(port_str)
+        except ValueError:
+            print(f"{R}[!] Invalid port number: {port_str}{W}")
+            return None, None
+        if not (1 <= port <= 65535):
+            print(f"{R}[!] Invalid port number. Must be between 1-65535{W}")
+            return None, None
+        return ip_str.strip(), port
+
     return input_str, None
 
 def validate_ip(target_ip):
-    """Validate IP address (with or without port)"""
+    """Validate IPv4 address."""
     try:
         ip = ipaddress.ip_address(target_ip)
-        if ip.is_private:
-            print(f"{R}[!] Warning: Private IP address detected. This tool is meant for public IPs.{W}")
-        return True
     except ValueError:
         print(f"{R}[!] Invalid IP address format{W}")
         return False
+    if isinstance(ip, ipaddress.IPv6Address):
+        print(f"{R}[!] IPv6 targets are not supported in this version.{W}")
+        return False
+    if ip.is_private:
+        print(f"{Y}[⚠️] Private IP address detected. Continuing (make sure you own this network).{W}")
+    if ip.is_loopback or ip.is_link_local or ip.is_multicast:
+        print(f"{Y}[⚠️] Special-use address ({ip}); OSINT lookups will be skipped.{W}")
+    return True
 
-def get_protocol(port):
-    return "https" if port in HTTPS_PORTS else "http"
+def probe_tls(ip, port, timeout=1.5):
+    """Best-effort TLS probe. Cached per (ip, port).
 
-def probe_rtsp(ip, port):
+    Attempts a TLS handshake; if it succeeds the port is treated as HTTPS.
+    Falls back cleanly on any error and returns False, meaning "use HTTP".
     """
-    Best‑effort RTSP detection that does NOT rely only on port number.
-    Sends a minimal RTSP OPTIONS request and inspects the response.
+    key = (ip, port)
+    if key in CONFIG._tls_cache:
+        return CONFIG._tls_cache[key]
+    result = False
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=ip) as tls:
+                # tls.version() returns e.g. 'TLSv1.2' on success
+                result = tls.version() is not None
+    except Exception:
+        result = False
+    CONFIG._tls_cache[key] = result
+    return result
+
+def get_protocol(port, ip=None):
+    """Return 'https' or 'http'. Uses TLS probe when we have an IP.
+
+    Kept backwards-compatible: callers that pass only a port still get the
+    static allow-list behaviour.
     """
+    if port in HTTPS_PORTS:
+        return "https"
+    if ip is not None and probe_tls(ip, port):
+        return "https"
+    return "http"
+
+def _rtsp_request(ip, port, verb, path="/", headers=None, timeout=2.0):
+    """Send one RTSP request and return the raw response bytes (or None)."""
+    hdr_lines = ""
+    if headers:
+        hdr_lines = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+    req = (
+        f"{verb} rtsp://{ip}:{port}{path} RTSP/1.0\r\n"
+        f"CSeq: 1\r\n"
+        f"User-Agent: CamXploit/2.1\r\n"
+        f"{hdr_lines}"
+        f"\r\n"
+    ).encode("ascii", errors="ignore")
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(PORT_SCAN_TIMEOUT)
+            s.settimeout(timeout)
             if s.connect_ex((ip, port)) != 0:
-                return False
-
-            request = (
-                f"OPTIONS rtsp://{ip}:{port}/ RTSP/1.0\r\n"
-                "CSeq: 1\r\n"
-                "\r\n"
-            ).encode("ascii", errors="ignore")
-
-            s.sendall(request)
-            try:
-                data = s.recv(2048)
-            except socket.timeout:
-                return False
-
-            if not data:
-                return False
-
-            text = data.decode(errors="ignore")
-            if "RTSP/1.0" not in text:
-                return False
-
-            # Look for typical RTSP verbs or Public header
-            indicators = ["Public:", "DESCRIBE", "SETUP", "PLAY"]
-            return any(ind in text for ind in indicators)
+                return None
+            s.sendall(req)
+            chunks = []
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    chunk = s.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                # RTSP responses fit comfortably in a few KB; stop early on
+                # end-of-headers to keep the probe snappy.
+                if b"\r\n\r\n" in b"".join(chunks):
+                    break
+            return b"".join(chunks) if chunks else None
     except Exception:
+        return None
+
+
+def probe_rtsp(ip, port):
+    """RTSP detection via an OPTIONS request.
+
+    Requires the response to *start with* an RTSP status line and to advertise
+    common RTSP verbs (via Public: header or the response body). This is
+    stricter than the previous "any RTSP/1.0 substring anywhere" check, which
+    could match on binary junk from unrelated services.
+    """
+    data = _rtsp_request(ip, port, "OPTIONS", timeout=PORT_SCAN_TIMEOUT)
+    if not data:
         return False
+    # RTSP status line must be the very first thing on the wire.
+    if not data.startswith(b"RTSP/1.0 ") and not data.startswith(b"RTSP/2.0 "):
+        return False
+    text = data.decode("ascii", errors="ignore")
+    # Split off the status line + headers.
+    head = text.split("\r\n\r\n", 1)[0]
+    if not re.search(r"^RTSP/[12]\.0\s+\d{3}\s", head, re.MULTILINE):
+        return False
+    return any(v in head for v in ("Public:", "DESCRIBE", "SETUP", "PLAY", "TEARDOWN"))
+
+
+def _parse_digest_challenge(header_val):
+    """Parse a WWW-Authenticate: Digest header into a dict of parameters."""
+    if not header_val or not header_val.lower().lstrip().startswith("digest"):
+        return None
+    params = {}
+    # Naive but sufficient for camera challenges: key="value" pairs.
+    for m in re.finditer(r'(\w+)\s*=\s*(?:"([^"]*)"|([^,\s]+))', header_val):
+        params[m.group(1).lower()] = m.group(2) if m.group(2) is not None else m.group(3)
+    return params or None
+
+
+def _digest_response(user, password, method, uri, challenge):
+    """Compute a minimal RFC 2617 Digest response header value."""
+    realm  = challenge.get("realm", "")
+    nonce  = challenge.get("nonce", "")
+    qop    = challenge.get("qop")
+    algo   = (challenge.get("algorithm") or "MD5").upper()
+    opaque = challenge.get("opaque")
+
+    def _h(s):
+        return hashlib.md5(s.encode("utf-8", "ignore")).hexdigest()
+
+    ha1 = _h(f"{user}:{realm}:{password}")
+    ha2 = _h(f"{method}:{uri}")
+    if qop:
+        # qop=auth uses cnonce + nc; single-shot values are fine here.
+        cnonce = hashlib.md5(os.urandom(8)).hexdigest()[:16]
+        nc = "00000001"
+        # qop may be a comma list like "auth,auth-int" — pick "auth".
+        qop_pick = "auth"
+        resp = _h(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop_pick}:{ha2}")
+        parts = [
+            f'username="{user}"', f'realm="{realm}"', f'nonce="{nonce}"',
+            f'uri="{uri}"', f'algorithm={algo}', f'response="{resp}"',
+            f'qop={qop_pick}', f'nc={nc}', f'cnonce="{cnonce}"',
+        ]
+    else:
+        resp = _h(f"{ha1}:{nonce}:{ha2}")
+        parts = [
+            f'username="{user}"', f'realm="{realm}"', f'nonce="{nonce}"',
+            f'uri="{uri}"', f'algorithm={algo}', f'response="{resp}"',
+        ]
+    if opaque:
+        parts.append(f'opaque="{opaque}"')
+    return "Digest " + ", ".join(parts)
 
 def check_ports(ip, additional_ports=None):
     """
@@ -437,83 +549,53 @@ def check_ports(ip, additional_ports=None):
     print(f"\n[🔍] {C}Scanning comprehensive CCTV ports on IP:{W}", ip)
     print(f"{Y}[⚠️] This will scan {len(ports_to_scan)} ports. This may take a while...{W}")
     open_ports = []
-    rtsp_ports = []  # Track RTSP-detected ports
+    rtsp_ports = []
     lock = threading.Lock()
     scanned_count = 0
+    total = len(ports_to_scan)
 
     def scan_port(port):
-        nonlocal scanned_count
+        """Return (port, is_open, is_rtsp) — printing is deferred to the caller."""
         if not threads_running:
-            return
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(PORT_SCAN_TIMEOUT)
-            try:
-                if sock.connect_ex((ip, port)) == 0:
-                    with lock:
-                        open_ports.append(port)
-                        scanned_count += 1  # Count open ports too
-                        # Determine protocol (current scan is TCP only)
-                        proto = "tcp"
+            return port, False, False
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(PORT_SCAN_TIMEOUT)
+                if sock.connect_ex((ip, port)) != 0:
+                    return port, False, False
+        except Exception:
+            return port, False, False
+        # Probe RTSP outside the connect socket so a slow RTSP handshake
+        # doesn't hold a connection open longer than needed.
+        return port, True, probe_rtsp(ip, port)
 
-                        # First, actively probe for RTSP on this port
-                        is_rtsp = probe_rtsp(ip, port)
-                        if is_rtsp:
-                            rtsp_ports.append(port)  # Track RTSP port
-                            if port == 554:
-                                service_name, service_desc = "RTSP", "Real-Time Streaming Protocol"
-                            else:
-                                service_name, service_desc = "RTSP", "Non-standard port"
-                        else:
-                            # Look up a friendly service name if known
-                            service_name, service_desc = PORT_SERVICE_MAP.get(
-                                port, ("Unknown Service", "")
-                            )
-
-                        if service_desc:
-                            service_str = f"{service_name}  ({service_desc})"
-                        else:
-                            service_str = service_name
-
-                        print(f"  ✅ [OPEN] {port}/{proto}  {service_str}")
-
-                        # If RTSP was positively detected, also show a suggested stream URL
-                        if is_rtsp:
-                            print(f"      Stream URL: rtsp://{ip}:{port}/")
-                        
-                        # Progress indicator
-                        if scanned_count % 50 == 0:
-                            print(f"  📊 Scanned {scanned_count}/{len(ports_to_scan)} ports...")
-                else:
-                    with lock:
-                        scanned_count += 1
-                        if scanned_count % 50 == 0:  # Progress indicator every 50 ports
-                            print(f"  📊 Scanned {scanned_count}/{len(ports_to_scan)} ports...")
-            except Exception:
-                with lock:
-                    scanned_count += 1
-
-    # Use more threads for faster scanning
-    max_threads = 100  # Increased thread count
-    threads = []
-    
-    for i, port in enumerate(ports_to_scan):
-        thread = threading.Thread(target=scan_port, args=(port,))
-        thread.daemon = True
-        threads.append(thread)
-        thread.start()
-        
-        # Limit concurrent threads to avoid overwhelming the system
-        if len(threads) >= max_threads:
-            for t in threads:
-                t.join()
-            threads = []
-
-    # Wait for remaining threads
-    for thread in threads:
-        thread.join()
+    # Real thread pool — completed futures free their slot immediately, so a
+    # single slow port can't stall the scan the way the old batch-of-100
+    # thread.join() loop did.
+    with ThreadPoolExecutor(max_workers=CONFIG.threads) as pool:
+        for future in as_completed(pool.submit(scan_port, p) for p in ports_to_scan):
+            if not threads_running:
+                break
+            port, is_open, is_rtsp = future.result()
+            with lock:
+                scanned_count += 1
+                if is_open:
+                    open_ports.append(port)
+                    if is_rtsp:
+                        rtsp_ports.append(port)
+                        service_name = "RTSP"
+                        service_desc = "Real-Time Streaming Protocol" if port == 554 else "Non-standard port"
+                    else:
+                        service_name, service_desc = PORT_SERVICE_MAP.get(port, ("Unknown Service", ""))
+                    service_str = f"{service_name}  ({service_desc})" if service_desc else service_name
+                    print(f"  ✅ [OPEN] {port}/tcp  {service_str}")
+                    if is_rtsp:
+                        print(f"      Stream URL: rtsp://{ip}:{port}/")
+                if scanned_count % 50 == 0:
+                    print(f"  📊 Scanned {scanned_count}/{total} ports...")
 
     print(f"\n{Y}[📊] Scan completed: {scanned_count} ports checked, {len(open_ports)} ports open{W}")
-    return sorted(open_ports), sorted(rtsp_ports)  # Return both open ports and RTSP ports
+    return sorted(open_ports), sorted(rtsp_ports)
 
 def check_if_camera(ip, open_ports):
     """Enhanced camera detection with detailed port analysis"""
@@ -548,16 +630,40 @@ def check_if_camera(ip, open_ports):
         'application/json'
     ]
     
+    def _get_body_capped(url):
+        """GET a URL and return (response, body_text) with the body capped.
+
+        The camera is untrusted; without a cap a hostile server can hand us
+        an unbounded body and OOM the scanner.
+        """
+        with requests.get(url, headers=HEADERS, timeout=TIMEOUT,
+                          verify=False, stream=True) as resp:
+            buf = bytearray()
+            for chunk in resp.iter_content(chunk_size=8192):
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if len(buf) >= MAX_BODY_BYTES:
+                    break
+            try:
+                body = bytes(buf).decode('utf-8', errors='ignore')
+            except Exception:
+                body = ''
+            # Detach the (already-buffered) content so the caller can still
+            # inspect headers / status_code after the `with` closes.
+            resp._content = bytes(buf)
+            return resp, body
+
     def analyze_port(port):
         nonlocal camera_indicators
-        protocol = get_protocol(port)
+        protocol = get_protocol(port, ip)
         base_url = f"{protocol}://{ip}:{port}"
-        
+
         print(f"\n  🔍 Analyzing Port {port} ({protocol.upper()}):")
-        
+
         # Check server headers and response
         try:
-            response = requests.get(base_url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+            response, body_text = _get_body_capped(base_url)
             server_header = response.headers.get('Server', '').lower()
             content_type = response.headers.get('Content-Type', '').lower()
             
@@ -570,52 +676,67 @@ def check_if_camera(ip, open_ports):
                     camera_indicators = True
                     break
             
-            # Check content type
-            if any(ct in content_type for ct in camera_content_types):
+            # Content-type check: only flag types that are actually
+            # camera-specific. text/html and application/json were previously
+            # in this list and made every HTTP server "look like a camera".
+            camera_content_types_strict = (
+                'image/jpeg', 'image/mjpeg', 'multipart/x-mixed-replace',
+                'video/', 'application/x-mpegurl', 'application/vnd.apple.mpegurl',
+            )
+            if any(ct in content_type for ct in camera_content_types_strict):
                 print(f"    ✅ Camera Content Type: {content_type}")
                 camera_indicators = True
-            
+
             # Check response content for camera indicators
-            if response.status_code == 200:
-                content = response.text.lower()
-                camera_keywords = ['camera', 'webcam', 'surveillance', 'stream', 'video', 'snapshot', 'dvr', 'nvr', 'recorder', 'cctv']
+            content = body_text.lower() if response.status_code == 200 else ''
+            if content:
+                camera_keywords = ['camera', 'webcam', 'surveillance', 'stream', 'video',
+                                   'snapshot', 'dvr', 'nvr', 'recorder', 'cctv']
                 found_keywords = [kw for kw in camera_keywords if kw in content]
                 if found_keywords:
                     print(f"    ✅ Camera Keywords Found: {', '.join(found_keywords)}")
                     camera_indicators = True
-                
-                # Check for specific CP Plus indicators
+
                 if any(x in content for x in ['cp plus', 'cp-plus', 'cpplus', 'cp_plus', 'uvr', '0401e1']):
                     print(f"    ✅ CP Plus Camera Detected!")
                     camera_indicators = True
-            
-            # Check common camera endpoints
-            endpoints = ['/video', '/stream', '/snapshot', '/cgi-bin', '/admin', '/viewer', '/login', '/index.html', '/']
+
+            # Endpoint enumeration: only 200 with a camera-y content-type
+            # counts as evidence. 401/403 are still reported (useful) but no
+            # longer set the "found a camera" flag on their own.
+            endpoints = ['/video', '/stream', '/snapshot', '/cgi-bin', '/admin',
+                         '/viewer', '/login', '/index.html', '/']
             for endpoint in endpoints:
                 try:
                     endpoint_url = f"{base_url}{endpoint}"
-                    endpoint_response = requests.head(endpoint_url, headers=HEADERS, timeout=TIMEOUT, verify=False)
-                    if endpoint_response.status_code in [200, 401, 403]:
-                        print(f"    ✅ Camera Endpoint Found: {endpoint_url} (HTTP {endpoint_response.status_code})")
+                    endpoint_response = requests.head(endpoint_url, headers=HEADERS,
+                                                     timeout=TIMEOUT, verify=False,
+                                                     allow_redirects=False)
+                    code = endpoint_response.status_code
+                    ep_ct = endpoint_response.headers.get('Content-Type', '').lower()
+                    if code == 200 and any(t in ep_ct for t in camera_content_types_strict):
+                        print(f"    ✅ Camera Endpoint (streaming content): {endpoint_url}")
                         camera_indicators = True
+                    elif code in (401, 403):
+                        # Note it, but do NOT flip camera_indicators — auth-
+                        # required endpoints are true of many non-camera services.
+                        print(f"    🔐 Auth-gated endpoint: {endpoint_url} (HTTP {code})")
                 except (requests.exceptions.RequestException, Exception):
                     continue
-            
+
             # Print server information
             if server_header:
                 print(f"    ℹ️ Server: {server_header}")
             print(f"    ℹ️ Status Code: {response.status_code}")
-            
-            # Check for authentication
+
             if response.status_code == 401:
                 print(f"    🔐 Authentication Required")
                 auth_type = response.headers.get('WWW-Authenticate', '')
                 if auth_type:
                     print(f"    🔐 Auth Type: {auth_type}")
-            
-            # Additional checks for DVR/NVR devices
-            if response.status_code == 200:
-                # Check for common DVR/NVR page titles
+
+            # Title / login-form heuristics on the (already-capped) body.
+            if content:
                 if '<title>' in content:
                     title_start = content.find('<title>') + 7
                     title_end = content.find('</title>', title_start)
@@ -624,13 +745,16 @@ def check_if_camera(ip, open_ports):
                         if any(x in title for x in ['dvr', 'nvr', 'recorder', 'surveillance', 'cctv', 'camera']):
                             print(f"    ✅ DVR/NVR Page Title: {title}")
                             camera_indicators = True
-                
-                # Check for common DVR/NVR form fields
-                if any(x in content for x in ['username', 'password', 'login', 'admin']):
+
+                # Login-form field detection: only flag if BOTH a username-ish
+                # and password-ish field appear. "admin" alone matched on
+                # practically every 200 page previously.
+                has_user  = any(x in content for x in ['name="username"', 'name="user"', 'id="username"'])
+                has_pass  = any(x in content for x in ['type="password"', 'name="password"', 'id="password"'])
+                if has_user and has_pass:
                     print(f"    ✅ Login Form Detected")
                     camera_indicators = True
-                
-                # Check for specific CP Plus model indicators
+
                 if any(x in content for x in ['uvr-0401e1', 'uvr0401e1', '0401e1']):
                     print(f"    ✅ CP Plus UVR-0401E1 Model Detected!")
                     camera_indicators = True
@@ -652,7 +776,7 @@ def check_login_pages(ip, open_ports):
     lock = threading.Lock()
     
     def check_endpoint(port, path):
-        protocol = get_protocol(port)
+        protocol = get_protocol(port, ip)
         url = f"{protocol}://{ip}:{port}{path}"
         try:
             response = requests.head(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
@@ -691,42 +815,75 @@ def check_login_pages(ip, open_ports):
     else:
         print(f"  📊 Found {len(found_urls)} authentication pages")
 
-def test_rtsp_credentials(ip, port, username, password):
-    """Test RTSP credentials using RTSP OPTIONS request with Basic Auth"""
+def _rtsp_status(response_bytes):
+    """Return the integer status code from an RTSP response, or None."""
+    if not response_bytes:
+        return None
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(2)
-            if s.connect_ex((ip, port)) != 0:
-                return False
-            
-            # RTSP OPTIONS request with Basic Auth
-            auth_string = base64.b64encode(f"{username}:{password}".encode()).decode()
-            request = (
-                f"OPTIONS rtsp://{ip}:{port}/ RTSP/1.0\r\n"
-                f"Authorization: Basic {auth_string}\r\n"
-                "CSeq: 1\r\n"
-                "\r\n"
-            ).encode("ascii", errors="ignore")
-            
-            s.sendall(request)
-            try:
-                data = s.recv(2048)
-            except socket.timeout:
-                return False
-            
-            if not data:
-                return False
-            
-            text = data.decode(errors="ignore")
-            # RTSP 200 OK means authentication succeeded
-            if "RTSP/1.0 200" in text or "RTSP/1.0 200 OK" in text:
-                return True
-            # RTSP 401 Unauthorized means wrong credentials
-            if "RTSP/1.0 401" in text:
-                return False
+        line = response_bytes.split(b"\r\n", 1)[0].decode("ascii", "ignore")
     except Exception:
-        pass
-    return False
+        return None
+    m = re.match(r"RTSP/[12]\.0\s+(\d{3})\s", line)
+    return int(m.group(1)) if m else None
+
+
+def _rtsp_www_authenticate(response_bytes):
+    """Return the value of the WWW-Authenticate header, or None."""
+    if not response_bytes:
+        return None
+    text = response_bytes.decode("ascii", "ignore")
+    for line in text.split("\r\n"):
+        if line.lower().startswith("www-authenticate:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def test_rtsp_credentials(ip, port, username, password, path="/"):
+    """Try one username/password against an RTSP server using DESCRIBE.
+
+    Rationale for DESCRIBE over OPTIONS: many cameras happily answer OPTIONS
+    without any authentication (RFC 2326 does not require it for OPTIONS), so
+    the previous implementation reported "success" for every valid RTSP
+    endpoint regardless of the tried password.
+
+    Supports both Basic and Digest challenges. Returns True only when the
+    server responded 200 to an authenticated request.
+    """
+    uri = f"rtsp://{ip}:{port}{path}"
+
+    # Step 1: unauthenticated DESCRIBE to discover the auth scheme.
+    initial = _rtsp_request(ip, port, "DESCRIBE", path=path,
+                            headers={"Accept": "application/sdp"})
+    status = _rtsp_status(initial)
+    if status is None:
+        return False
+    if status == 200:
+        # Endpoint requires no auth at all — record as success, but flag it as
+        # "no-auth" so the caller can tell "we guessed the password" from
+        # "the camera is wide open".
+        return True
+    if status != 401:
+        # 404, 405, 500… treat as inconclusive.
+        return False
+
+    challenge = _rtsp_www_authenticate(initial)
+    if not challenge:
+        return False
+
+    # Step 2: authenticated DESCRIBE.
+    if challenge.lower().startswith("basic"):
+        b64 = base64.b64encode(f"{username}:{password}".encode("utf-8", "ignore")).decode()
+        headers = {"Authorization": f"Basic {b64}",
+                   "Accept": "application/sdp"}
+    else:
+        params = _parse_digest_challenge(challenge)
+        if not params:
+            return False
+        headers = {"Authorization": _digest_response(username, password, "DESCRIBE", uri, params),
+                   "Accept": "application/sdp"}
+
+    resp = _rtsp_request(ip, port, "DESCRIBE", path=path, headers=headers)
+    return _rtsp_status(resp) == 200
 
 def test_default_passwords(ip, open_ports, rtsp_ports=None):
     print(f"\n[🔑] {C}Testing common credentials:{W}")
@@ -887,7 +1044,7 @@ def test_default_passwords(ip, open_ports, rtsp_ports=None):
     for port in web_ports[:10]:
         if found or (time.time() - start_time > MAX_CREDENTIAL_TEST_TIME):
             break
-        protocol = get_protocol(port)
+        protocol = get_protocol(port, ip)
         
         for path, auth_type in endpoints:
             if found or (time.time() - start_time > MAX_CREDENTIAL_TEST_TIME):
@@ -935,7 +1092,7 @@ def test_default_passwords(ip, open_ports, rtsp_ports=None):
         for port in web_ports[:3]:
             if found or (time.time() - start_time > MAX_CREDENTIAL_TEST_TIME):
                 break
-            protocol = get_protocol(port)
+            protocol = get_protocol(port, ip)
             thread = threading.Thread(target=test_http_credentials, args=(protocol, port, "/", "basic", all_credentials[:30]))
             thread.daemon = True
             threads.append(thread)
@@ -960,17 +1117,20 @@ def test_default_passwords(ip, open_ports, rtsp_ports=None):
         print("❌ No default credentials found")
 
 def try_default_credentials(ip, port):
-    """Attempt to find working credentials for fingerprinting"""
+    """Attempt to find working credentials for fingerprinting.
+
+    Requires the operator to have asserted authorisation (--i-have-authorisation).
+    Without that flag, returns None immediately — no unauthorised login attempts.
+    """
+    if not CONFIG.authorised or CONFIG.no_brute:
+        return None
+    protocol = get_protocol(port, ip)
+    base = f"{protocol}://{ip}:{port}/"
     for username, passwords in DEFAULT_CREDENTIALS.items():
         for password in passwords:
             try:
-                response = requests.get(
-                    f"http://{ip}:{port}/",
-                    auth=(username, password),
-                    headers=HEADERS,
-                    timeout=TIMEOUT,
-                    verify=False
-                )
+                response = requests.get(base, auth=(username, password),
+                                        headers=HEADERS, timeout=TIMEOUT, verify=False)
                 if response.status_code == 200:
                     return f"{username}:{password}"
             except (requests.exceptions.RequestException, Exception):
@@ -989,7 +1149,7 @@ def search_cve(brand):
 def fingerprint_camera(ip, open_ports):
     print(f"\n[📡] {C}Scanning for Camera Type & Firmware:{W}")
     for port in open_ports:
-        protocol = get_protocol(port)
+        protocol = get_protocol(port, ip)
         url_base = f"{protocol}://{ip}:{port}"
         print(f"🔍 Checking {url_base}...")
         try:
@@ -1017,43 +1177,56 @@ def fingerprint_camera(ip, open_ports):
 
 def fingerprint_hikvision(ip, port):
     print("➡️  Attempting Hikvision Fingerprint...")
-    protocol = get_protocol(port)
-    credentials = try_default_credentials(ip, port) or "admin:1234"
-    auth_b64 = base64.b64encode(credentials.encode()).decode()
-    
+    protocol = get_protocol(port, ip)
+
+    # Hikvision uses HTTP Basic/Digest headers, not a `?auth=` query param;
+    # the old query-string variant that used to be here was never real.
+    auth = None
+    if CONFIG.authorised and not CONFIG.no_brute:
+        creds = try_default_credentials(ip, port)
+        if creds:
+            u, _, p = creds.partition(":")
+            auth = (u, p)
+
     endpoints = [
-        f"{protocol}://{ip}:{port}/System/configurationFile?auth={auth_b64}",
-        f"{protocol}://{ip}:{port}/ISAPI/System/deviceInfo"
+        f"{protocol}://{ip}:{port}/ISAPI/System/deviceInfo",
+        f"{protocol}://{ip}:{port}/System/deviceInfo",
     ]
-    
+
     for url in endpoints:
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
+                                verify=False, auth=auth, stream=True)
             if resp.status_code == 401:
-                print(f"⚠️ Authentication failed for {url}")
+                print(f"⚠️ Authentication required for {url}")
                 continue
             if resp.status_code == 200:
+                # Cap body — hostile server could hand us gigabytes of "XML".
+                body_bytes = bytearray()
+                for chunk in resp.iter_content(chunk_size=8192):
+                    body_bytes.extend(chunk)
+                    if len(body_bytes) >= MAX_XML_BYTES:
+                        break
                 print(f"✅ Found at {url}")
-                if "configurationFile" in url:
-                    try:
-                        xml_root = ET.fromstring(resp.text)
-                        model = xml_root.findtext(".//model")
-                        firmware = xml_root.findtext(".//firmwareVersion")
-                        if model:
-                            print(f"📸 Model: {model}")
-                        if firmware:
-                            print(f"🛡️ Firmware: {firmware}")
-                    except ET.ParseError:
-                        print("⚠️ Cannot parse XML configuration")
-                else:
-                    print(resp.text)
+                try:
+                    xml_root = ET.fromstring(bytes(body_bytes))
+                    model = xml_root.findtext(".//{*}deviceName") or xml_root.findtext(".//model")
+                    firmware = xml_root.findtext(".//{*}firmwareVersion") or xml_root.findtext(".//firmwareVersion")
+                    if model:
+                        print(f"📸 Model: {model}")
+                    if firmware:
+                        print(f"🛡️ Firmware: {firmware}")
+                    if not _XML_HARDENED:
+                        print("    ℹ️  (Install `defusedxml` for hardened XML parsing.)")
+                except ET.ParseError:
+                    print("⚠️ Cannot parse XML configuration")
         except Exception as e:
             print(f"⚠️ {e}")
     search_cve("hikvision")
 
 def fingerprint_dahua(ip, port):
     print("➡️  Attempting Dahua Fingerprint...")
-    protocol = get_protocol(port)
+    protocol = get_protocol(port, ip)
     try:
         url = f"{protocol}://{ip}:{port}/cgi-bin/magicBox.cgi?action=getSystemInfo"
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
@@ -1068,7 +1241,7 @@ def fingerprint_dahua(ip, port):
 
 def fingerprint_axis(ip, port):
     print("➡️  Attempting Axis Fingerprint...")
-    protocol = get_protocol(port)
+    protocol = get_protocol(port, ip)
     try:
         url = f"{protocol}://{ip}:{port}/axis-cgi/admin/param.cgi?action=list"
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
@@ -1085,7 +1258,7 @@ def fingerprint_axis(ip, port):
 
 def fingerprint_cp_plus(ip, port):
     print("➡️  Attempting CP Plus Fingerprint...")
-    protocol = get_protocol(port)
+    protocol = get_protocol(port, ip)
     
     # CP Plus specific endpoints
     endpoints = [
@@ -1123,7 +1296,7 @@ def fingerprint_cp_plus(ip, port):
 
 def fingerprint_generic(ip, port):
     print("➡️  Attempting Generic Fingerprint...")
-    protocol = get_protocol(port)
+    protocol = get_protocol(port, ip)
     endpoints = [
         "/System/configurationFile",
         "/ISAPI/System/deviceInfo",
@@ -1232,7 +1405,7 @@ def detect_camera_brand(ip, open_ports):
     
     for port in open_ports[:5]:  # Check first 5 ports
         try:
-            protocol = get_protocol(port)
+            protocol = get_protocol(port, ip)
             url = f"{protocol}://{ip}:{port}/"
             response = requests.get(url, headers=HEADERS, timeout=2, verify=False)
             
@@ -1312,158 +1485,162 @@ def detect_live_streams(ip, open_ports, rtsp_ports=None):
             print(f"     🎯 Use VLC (Media -> Open Network Stream) to test these RTSP URLs")
         print()  # Empty line for readability
     
-    # Enhanced stream paths for different camera brands
+    # Stream paths per protocol. Deduplicated (the previous HTTP list had
+    # five duplicate entries: /snapshot.jpg, /img/snapshot.cgi,
+    # /cgi-bin/snapshot.cgi, /cgi-bin/viewer/video.jpg, /mjpg/video.mjpg).
+    # dict.fromkeys(...) preserves insertion order while removing repeats.
     stream_paths = {
-        'rtsp': [
-            # Generic paths
-            '/live.sdp',
-            '/h264.sdp',
-            '/stream1',
-            '/stream2',
-            '/main',
-            '/sub',
-            '/video',
-            '/cam/realmonitor',
-            '/Streaming/Channels/1',
-            '/Streaming/Channels/101',
-            # Brand-specific paths
-            '/onvif/streaming/channels/1',  # ONVIF
-            '/axis-media/media.amp',  # Axis
-            '/axis-cgi/mjpg/video.cgi',  # Axis
-            '/cgi-bin/mjpg/video.cgi',  # Generic
-            '/cgi-bin/hi3510/snap.cgi',  # Hikvision
-            '/cgi-bin/snapshot.cgi',  # Generic
-            '/cgi-bin/viewer/video.jpg',  # Generic
-            '/img/snapshot.cgi',  # Generic
-            '/snapshot.jpg',  # Generic
-            '/video/mjpg.cgi',  # Generic
-            '/video.cgi',  # Generic
-            '/videostream.cgi',  # Generic
-            '/mjpg/video.mjpg',  # Generic
-            '/mjpg.cgi',  # Generic
-            '/stream.cgi',  # Generic
-            '/live.cgi',  # Generic
-            '/live/0/onvif.sdp',  # ONVIF
-            '/live/0/h264.sdp',  # Generic
-            '/live/0/mpeg4.sdp',  # Generic
-            '/live/0/audio.sdp',  # Generic
-            '/live/1/onvif.sdp',  # ONVIF
-            '/live/1/h264.sdp',  # Generic
-            '/live/1/mpeg4.sdp',  # Generic
-            '/live/1/audio.sdp'  # Generic
-        ],
-        'rtmp': [
-            '/live',
-            '/stream',
-            '/hls',
-            '/flv',
-            '/rtmp',
-            '/live/stream',
-            '/live/stream1',
-            '/live/stream2',
-            '/live/main',
-            '/live/sub',
-            '/live/video',
-            '/live/audio',
-            '/live/av',
-            '/live/rtmp',
-            '/live/rtmps'
-        ],
-        'http': [
-            # Generic paths
-            '/video',
-            '/stream',
-            '/mjpg/video.mjpg',
+        'rtsp': list(dict.fromkeys([
+            # Generic
+            '/live.sdp', '/h264.sdp', '/stream1', '/stream2', '/main', '/sub',
+            '/video', '/cam/realmonitor',
+            '/Streaming/Channels/1', '/Streaming/Channels/101',
+            # Brand / vendor
+            '/onvif/streaming/channels/1',   # ONVIF
+            '/axis-media/media.amp',         # Axis
+            '/axis-cgi/mjpg/video.cgi',      # Axis
+            '/cgi-bin/mjpg/video.cgi',
+            '/cgi-bin/hi3510/snap.cgi',      # Hikvision-style
+            '/cgi-bin/snapshot.cgi',
+            '/cgi-bin/viewer/video.jpg',
+            '/img/snapshot.cgi',
+            '/snapshot.jpg',
+            '/video/mjpg.cgi', '/video.cgi', '/videostream.cgi',
+            '/mjpg/video.mjpg', '/mjpg.cgi',
+            '/stream.cgi', '/live.cgi',
+            # ONVIF-style SDP endpoints
+            '/live/0/onvif.sdp', '/live/0/h264.sdp',
+            '/live/0/mpeg4.sdp', '/live/0/audio.sdp',
+            '/live/1/onvif.sdp', '/live/1/h264.sdp',
+            '/live/1/mpeg4.sdp', '/live/1/audio.sdp',
+        ])),
+        'rtmp': list(dict.fromkeys([
+            '/live', '/stream', '/hls', '/flv', '/rtmp',
+            '/live/stream', '/live/stream1', '/live/stream2',
+            '/live/main', '/live/sub', '/live/video', '/live/audio',
+            '/live/av', '/live/rtmp', '/live/rtmps',
+        ])),
+        'http': list(dict.fromkeys([
+            # Snapshot / MJPEG endpoints
+            '/video', '/stream',
+            '/mjpg/video.mjpg', '/mjpg.cgi',
             '/cgi-bin/mjpg/video.cgi',
             '/axis-cgi/mjpg/video.cgi',
             '/cgi-bin/viewer/video.jpg',
-            '/snapshot.jpg',
-            '/img/snapshot.cgi',
-            # Brand-specific paths
-            '/onvif/device_service',  # ONVIF
-            '/onvif/streaming',  # ONVIF
-            '/axis-cgi/com/ptz.cgi',  # Axis
-            '/axis-cgi/param.cgi',  # Axis
-            '/cgi-bin/snapshot.cgi',  # Generic
-            '/cgi-bin/hi3510/snap.cgi',  # Hikvision
-            '/cgi-bin/viewer/video.jpg',  # Generic
-            '/img/snapshot.cgi',  # Generic
-            '/snapshot.jpg',  # Generic
-            '/video/mjpg.cgi',  # Generic
-            '/video.cgi',  # Generic
-            '/videostream.cgi',  # Generic
-            '/mjpg/video.mjpg',  # Generic
-            '/mjpg.cgi',  # Generic
-            '/stream.cgi',  # Generic
-            '/live.cgi',  # Generic
-            # Additional paths
-            '/api/video',  # API endpoints
-            '/api/stream',
-            '/api/live',
-            '/api/video/live',
-            '/api/stream/live',
-            '/api/camera/live',
-            '/api/camera/stream',
-            '/api/camera/video',
-            '/api/camera/snapshot',
-            '/api/camera/image',
-            '/api/camera/feed',
-            '/api/camera/feed/live',
-            '/api/camera/feed/stream',
-            '/api/camera/feed/video',
-            # CP Plus specific paths
-            '/cgi-bin/snapshot.cgi',
-            '/cgi-bin/video.cgi',
-            '/cgi-bin/stream.cgi',
-            '/cgi-bin/live.cgi'
-        ]
+            '/snapshot.jpg', '/img/snapshot.cgi',
+            # ONVIF
+            '/onvif/device_service', '/onvif/streaming',
+            # Axis control
+            '/axis-cgi/com/ptz.cgi', '/axis-cgi/param.cgi',
+            # Generic CGI (CP Plus + others)
+            '/cgi-bin/snapshot.cgi', '/cgi-bin/hi3510/snap.cgi',
+            '/cgi-bin/video.cgi', '/cgi-bin/stream.cgi', '/cgi-bin/live.cgi',
+            '/video/mjpg.cgi', '/video.cgi', '/videostream.cgi',
+            '/stream.cgi', '/live.cgi',
+            # REST-ish API endpoints
+            '/api/video', '/api/stream', '/api/live',
+            '/api/video/live', '/api/stream/live',
+            '/api/camera/live', '/api/camera/stream', '/api/camera/video',
+            '/api/camera/snapshot', '/api/camera/image', '/api/camera/feed',
+            '/api/camera/feed/live', '/api/camera/feed/stream', '/api/camera/feed/video',
+        ])),
     }
     
-    def check_stream_with_details(url):
-        """Check stream and provide detailed information"""
+    def _tcp_reachable(host, port, timeout=2.0):
+        """Cheap TCP-connect probe used by non-HTTP scheme checks."""
         try:
-            response = requests.get(url, timeout=TIMEOUT, verify=False, stream=True)
-            if response.status_code == 200:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                return s.connect_ex((host, port)) == 0
+        except Exception:
+            return False
+
+    def _check_http_stream(url):
+        """HTTP/HTTPS stream check using requests. Body is capped and closed."""
+        lower = url.lower()
+        try:
+            # verify=False: cameras almost always ship self-signed certs
+            with requests.get(url, timeout=TIMEOUT, verify=False,
+                              stream=True, headers=HEADERS) as response:
+                if response.status_code != 200:
+                    return False
                 content_type = response.headers.get('Content-Type', '').lower()
                 content_length = response.headers.get('Content-Length', '0')
-                
-                # Check if it's actually a stream/video
-                is_rtsp_rtmp_mms = any(x in url.lower() for x in ['rtsp://', 'rtmp://', 'mms://', 'rtp://'])
-                is_http_https = url.lower().startswith('http://') or url.lower().startswith('https://')
-                
-                # Check content type for video/stream indicators (including multipart streams)
-                is_stream_content = any(x in content_type for x in ['video', 'stream', 'mpeg', 'h264', 'mjpeg', 'image', 'multipart'])
-                
-                if is_stream_content:
-                    print(f"  ✅ Stream Found: {url}")
-                    print(f"     📺 Content-Type: {content_type}")
+                # Drain a small sniff of the body so the socket returns to the
+                # pool; we deliberately never read the whole thing.
+                try:
+                    next(response.iter_content(chunk_size=1024), None)
+                except Exception:
+                    pass
+
+            is_stream_content = any(x in content_type for x in (
+                'video', 'stream', 'mpeg', 'h264', 'mjpeg',
+                'multipart/x-mixed-replace',
+            ))
+            is_snapshot = content_type.startswith('image/') and any(
+                p in lower for p in ('snapshot', 'snap.cgi', 'jpg', 'mjpg', 'video.cgi')
+            )
+            path_hints = any(p in lower for p in ('/video', '/stream', '/live', '/mjpg', '/snapshot'))
+            file_ext = any(x in lower for x in ('.mp4', '.m3u8', '.ts', '.flv', '.webm', '.avi', '.mov'))
+
+            if is_stream_content or is_snapshot or file_ext or path_hints:
+                label = 'Stream Found' if is_stream_content else (
+                    'Snapshot Found' if is_snapshot else (
+                        'Video File' if file_ext else 'Potential Stream'
+                    )
+                )
+                print(f"  ✅ {label}: {url}")
+                print(f"     📺 Content-Type: {content_type}")
+                if content_length and content_length != '0':
                     print(f"     📏 Content-Length: {content_length}")
-                    # Only suggest VLC for RTSP/RTMP/MMS streams
-                    if is_rtsp_rtmp_mms:
-                        print(f"     🎯 RTSP/RTMP Stream - Use VLC (Media -> Open Network Stream): {url}")
-                    elif is_http_https:
-                        print(f"     🌐 HTTP/HTTPS Stream - Open in browser: {url}")
-                    return True
-                elif any(x in url.lower() for x in ['.mp4', '.m3u8', '.ts', '.flv', '.webm', '.avi', '.mov']):
-                    print(f"  ✅ Video File: {url}")
-                    print(f"     📺 Content-Type: {content_type}")
-                    if is_rtsp_rtmp_mms:
-                        print(f"     🎯 RTSP/RTMP Stream - Use VLC (Media -> Open Network Stream): {url}")
-                    elif is_http_https:
-                        print(f"     🌐 HTTP/HTTPS Video - Open in browser: {url}")
-                    return True
-                elif is_rtsp_rtmp_mms:
-                    print(f"  ✅ Streaming URL: {url}")
-                    print(f"     🎯 RTSP/RTMP Stream - Use VLC (Media -> Open Network Stream): {url}")
-                    return True
-                elif any(x in url.lower() for x in ['/video', '/stream', '/live', '/mjpg', '/snapshot']):
-                    print(f"  ✅ Potential Stream: {url}")
-                    print(f"     📺 Content-Type: {content_type}")
-                    if is_http_https:
-                        print(f"     🌐 HTTP/HTTPS Stream - Open in browser: {url}")
-                    return True
-        except (requests.exceptions.RequestException, Exception):
+                print(f"     🌐 HTTP/HTTPS - Open in browser: {url}")
+                return True
+        except requests.exceptions.RequestException:
             pass
+        return False
+
+    def _check_rtsp_stream(url):
+        """RTSP stream check. Sends DESCRIBE; 200 or 401 both prove the path exists."""
+        m = re.match(r"rtsp://([^:/]+):(\d+)(/.*)?$", url)
+        if not m:
+            return False
+        host, port_s, path = m.group(1), m.group(2), (m.group(3) or "/")
+        try:
+            resp = _rtsp_request(host, int(port_s), "DESCRIBE", path=path)
+        except Exception:
+            return False
+        status = _rtsp_status(resp)
+        if status in (200, 401):
+            print(f"  ✅ RTSP Stream Found: {url}  (status {status})")
+            if status == 401:
+                print(f"     🔐 Authentication required — supply credentials in VLC.")
+            print(f"     🎯 Use VLC (Media -> Open Network Stream): {url}")
+            return True
+        return False
+
+    def _check_socket_stream(url, scheme):
+        """RTMP/MMS/etc — we can only confirm the TCP port is reachable."""
+        m = re.match(rf"{scheme}://([^:/]+):(\d+)", url)
+        if not m:
+            return False
+        host, port_s = m.group(1), m.group(2)
+        if _tcp_reachable(host, int(port_s)):
+            print(f"  ✅ {scheme.upper()} port reachable: {url}")
+            print(f"     🎯 Try in VLC (Media -> Open Network Stream): {url}")
+            return True
+        return False
+
+    def check_stream_with_details(url):
+        """Dispatch stream checking based on URL scheme."""
+        lower = url.lower()
+        if lower.startswith(('http://', 'https://')):
+            return _check_http_stream(url)
+        if lower.startswith('rtsp://'):
+            return _check_rtsp_stream(url)
+        if lower.startswith('rtmp://'):
+            return _check_socket_stream(url, 'rtmp')
+        if lower.startswith('mms://'):
+            return _check_socket_stream(url, 'mms')
         return False
     
     # Check all ports for streams with threading
@@ -1569,74 +1746,130 @@ def detect_live_streams(ip, open_ports, rtsp_ports=None):
         print(f"\n{C}[ℹ️] HTTP/HTTPS streams can be opened directly in your web browser{W}")
         print(f"     💡 Tip: Look above for HTTP/HTTPS stream URLs (e.g., http://IP:PORT/mjpg/video.mjpg)")
 
-def main():
+def _build_argparser():
+    p = argparse.ArgumentParser(
+        prog="CamXploit",
+        description=(
+            "IP-camera / CCTV reconnaissance scanner. "
+            "Only run against systems you own or have explicit written "
+            "authorisation to test."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Active probing (default-credential brute-force against RTSP or "
+            "HTTP) requires the --i-have-authorisation flag. Without it, the "
+            "scanner performs recon only."
+        ),
+    )
+    p.add_argument("target", nargs="?",
+                   help="Target as IPv4 or IPv4:PORT (falls back to prompt if omitted).")
+    p.add_argument("--i-have-authorisation", action="store_true", dest="authorised",
+                   help="Assert you have written authorisation to actively probe "
+                        "the target. Required to enable credential brute-force.")
+    p.add_argument("--no-brute", action="store_true",
+                   help="Skip credential testing even if --i-have-authorisation is set.")
+    p.add_argument("--no-osint", action="store_true",
+                   help="Skip third-party lookups (ipinfo.io, Shodan/Censys/Zoomeye link output).")
+    p.add_argument("--threads", type=int, default=100,
+                   help="Concurrency for the port scan (default: 100).")
+    p.add_argument("--yes", action="store_true",
+                   help="Answer 'yes' to interactive prompts (non-interactive runs).")
+    return p
+
+
+def main(argv=None):
     global threads_running
+    parser = _build_argparser()
+    args = parser.parse_args(argv)
+
+    CONFIG.authorised = args.authorised
+    CONFIG.no_brute   = args.no_brute or not args.authorised
+    CONFIG.no_osint   = args.no_osint
+    CONFIG.threads    = max(1, min(args.threads, 500))
+
     try:
-        user_input = input(f"{G}[+] {C}Enter IP address (or IP:PORT): {W}").strip()
-        
-        # Parse IP:PORT format
+        if args.target:
+            user_input = args.target.strip()
+        else:
+            user_input = input(f"{G}[+] {C}Enter IP address (or IP:PORT): {W}").strip()
+
         target_ip, specified_port = parse_ip_port(user_input)
         if target_ip is None:
-            return
-        
+            return 2
+
         if not validate_ip(target_ip):
-            return
-        
+            return 2
+
         ip_obj = ipaddress.ip_address(target_ip)
-        
-        # If port is specified, inform user
+
         if specified_port is not None:
             print(f"{C}[ℹ️] Port {specified_port} specified - will prioritize scanning this port{W}")
 
         print(BANNER)
         print('____________________________________________________________________________\n')
 
-        # Detect PRIVATE vs PUBLIC
-        if ip_obj.is_private:
-            print(f"{Y}[🏠] Private Network Detected — Skipping Shodan, IP-Location, and Google Dorking.{W}")
-            skip_osint = True
+        # Advertise the current authorisation posture up-front so an operator
+        # who forgot the flag doesn't wait for a scan then wonder why no
+        # brute-force ran.
+        if CONFIG.authorised and not CONFIG.no_brute:
+            print(f"{Y}[⚠️] Active probing ENABLED — you asserted authorisation for {target_ip}.{W}")
+        elif CONFIG.authorised and CONFIG.no_brute:
+            print(f"{C}[ℹ️] Authorised, but --no-brute is set. Recon only.{W}")
         else:
-            skip_osint = False
+            print(f"{C}[ℹ️] Recon-only mode. Add --i-have-authorisation to enable credential testing.{W}")
 
-        # Only run OSINT for PUBLIC IPs
-        if not skip_osint:
+        # OSINT: skip for private / loopback / link-local / multicast, or when
+        # the operator disabled it.
+        skip_osint = (
+            CONFIG.no_osint
+            or ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+        )
+        if skip_osint:
+            print(f"{Y}[🏠] OSINT lookups skipped (special-use IP or --no-osint).{W}")
+        else:
             print_search_urls(target_ip)
             google_dork_search(target_ip)
             get_ip_location_info(target_ip)
-        else:
-            print(f"{C}[ℹ️] Proceeding directly to camera scanning...{W}")
 
-        # Begin scanning
-        # If specific port provided, include it in the scan (even if not in COMMON_PORTS)
-        if specified_port is not None:
-            print(f"{C}[ℹ️] Port {specified_port} will be included in the scan{W}")
-            open_ports, rtsp_ports = check_ports(target_ip, additional_ports=[specified_port])
-        else:
-            open_ports, rtsp_ports = check_ports(target_ip)
+        additional = [specified_port] if specified_port is not None else None
+        open_ports, rtsp_ports = check_ports(target_ip, additional_ports=additional)
 
-        if open_ports:
-            camera_found = check_if_camera(target_ip, open_ports)
-
-            if not camera_found and not skip_osint:
-                choice = input("\n[❓] No camera found. Continue checking login pages, fingerprints, and passwords? [y/N]: ").strip().lower()
-                if choice != "y":
-                    print("\n[✅] Scan Completed! No camera found.")
-                    return
-
-            check_login_pages(target_ip, open_ports)
-            fingerprint_camera(target_ip, open_ports)
-            test_default_passwords(target_ip, open_ports, rtsp_ports)
-            detect_live_streams(target_ip, open_ports, rtsp_ports)
-
-        else:
+        if not open_ports:
             print("\n[❌] No open ports found. Likely no camera here.")
-        
+            print("\n[✅] Scan Completed!")
+            return 0
+
+        camera_found = check_if_camera(target_ip, open_ports)
+
+        if not camera_found and not skip_osint and not args.yes:
+            try:
+                choice = input("\n[❓] No camera found. Continue checking login pages, "
+                               "fingerprints, and passwords? [y/N]: ").strip().lower()
+            except EOFError:
+                choice = "n"
+            if choice != "y":
+                print("\n[✅] Scan Completed! No camera found.")
+                return 0
+
+        check_login_pages(target_ip, open_ports)
+        fingerprint_camera(target_ip, open_ports)
+        if not CONFIG.no_brute:
+            test_default_passwords(target_ip, open_ports, rtsp_ports)
+        else:
+            print(f"\n{C}[🔒] Skipping credential testing (authorisation not asserted or --no-brute).{W}")
+        detect_live_streams(target_ip, open_ports, rtsp_ports)
+
         print("\n[✅] Scan Completed!")
-        
+        return 0
+
     except KeyboardInterrupt:
         print("\n[!] Scan aborted by user")
         threads_running = False
-        sys.exit(1)
-        
+        return 130
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

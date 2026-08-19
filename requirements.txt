@@ -1,2 +1,5 @@
-requests
-ipaddress
+requests>=2.28
+# Optional but recommended — hardens XML parsing of camera config responses.
+# The tool falls back to xml.etree.ElementTree with a body-size cap if this
+# is missing.
+defusedxml>=0.7
