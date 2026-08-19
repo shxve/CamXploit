@@ -3,6 +3,7 @@ import base64
 import hashlib
 import ipaddress
 import os
+import random
 import re
 import socket
 import ssl
@@ -236,8 +237,36 @@ DEFAULT_CREDENTIALS = {
 # Ports for which we default to HTTPS; a TLS probe supersedes this list at
 # runtime (see get_protocol / probe_tls).
 HTTPS_PORTS = {443, 8443, 8444, 9443, 4433, 7443}
+# Realistic, current browser User-Agents. Many cameras and embedded web servers
+# vary their behaviour (or gate access) based on the User-Agent, so a scanner
+# that identifies itself as a bot gets less representative responses than a real
+# browser would. One is chosen at random per run. Refresh these periodically as
+# browser versions advance.
+USER_AGENTS = [
+    # Chrome / Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    # Chrome / macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    # Edge / Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0",
+    # Firefox / Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:141.0) Gecko/20100101 Firefox/141.0",
+    # Firefox / Linux
+    "Mozilla/5.0 (X11; Linux x86_64; rv:141.0) Gecko/20100101 Firefox/141.0",
+    # Safari / macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/18.3 Safari/605.1.15",
+]
+
+# Browsers don't speak RTSP; cameras commonly see VLC / live555 on that port,
+# so the raw RTSP probes present a realistic media-client identifier instead.
+RTSP_USER_AGENT = "LibVLC/3.0.21 (LIVE555 Streaming Media v2023.07.20)"
+
 HEADERS = {
-    'User-Agent': 'CamXploit/2.2 (+https://github.com/spyboy-productions/CamXploit)'
+    'User-Agent': random.choice(USER_AGENTS),
 }
 TIMEOUT = 5
 PORT_SCAN_TIMEOUT = 1.5
@@ -481,7 +510,7 @@ def _rtsp_request(ip, port, verb, path="/", headers=None, timeout=2.0):
     req = (
         f"{verb} rtsp://{ip}:{port}{path} RTSP/1.0\r\n"
         f"CSeq: 1\r\n"
-        f"User-Agent: CamXploit/2.2\r\n"
+        f"User-Agent: {RTSP_USER_AGENT}\r\n"
         f"{hdr_lines}"
         f"\r\n"
     ).encode("ascii", errors="ignore")
