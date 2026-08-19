@@ -38,7 +38,22 @@ CamXploit is intended for **security research, awareness, and authorized testing
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/spyboy-productions/CamXploit/blob/main/CamXploit.ipynb)
 
+> Colab is non-interactive — pass the target on the command line:
+> `!python3 CamXploit.py 1.2.3.4 --yes`
+> (add `--i-have-authorisation` if you have written permission to actively probe).
+
 ---
+
+## 🆕 What's New in v2.1
+
+- **Command-line interface** — pass the target directly (`python CamXploit.py 1.2.3.4`) or as `IP:PORT`. Interactive prompt still works when no target is given.
+- **Authorisation gate** — active probing (default-credential brute-force against RTSP and HTTP) is now **off by default**. Add `--i-have-authorisation` to enable it. Without the flag, the tool performs recon only.
+- **Correct RTSP checking** — `DESCRIBE` with Basic + Digest support instead of the old OPTIONS-with-Basic approach that returned false positives on every RTSP endpoint. Non-HTTP schemes (`rtsp://`, `rtmp://`, `mms://`) are no longer silently dropped by the `requests` client.
+- **TLS auto-detection** — HTTPS is inferred from a real handshake (cached per host:port), not a three-port allow-list, so cameras that serve TLS on 9443/4433/etc. are now covered.
+- **Thread pool everywhere** — port scan, login-page probe, credential test, and stream check all use `ThreadPoolExecutor`, so one slow endpoint no longer stalls a batch of 100.
+- **Pooled HTTP session** — `requests.Session` reuses TCP+TLS per host, cutting handshake overhead on multi-port targets.
+- **Hardened response handling** — response bodies are capped (256 KiB HTML, 64 KiB XML) so a hostile camera can't OOM the scanner; XML is parsed via `defusedxml` when installed.
+- **Data-quality fixes** — the Hikvision CVE list no longer contains ten Windows-kernel CVEs that were tagged as camera bugs; other brand lists trimmed to manually-verified entries.
 
 ## 🆕 What's New in v2.0.2
 - **RTSP Detection & Testing**: Actively probes ports for RTSP (not just port 554), detects RTSP on non-standard ports (e.g., 443, 8000)
@@ -91,56 +106,78 @@ CamXploit is intended for **security research, awareness, and authorized testing
 
 ---
 
-## 🛠️ **Installation**  
+## 🛠️ **Installation**
 
-### **1️⃣ Clone the Repository**  
 ```bash
 git clone https://github.com/spyboy-productions/CamXploit.git
-```
-```
 cd CamXploit
-```  
-```bash
 pip install -r requirements.txt
 ```
+
+Python 3.7+ is required. `defusedxml` is optional but recommended — without it the tool falls back to `xml.etree.ElementTree` with a strict body-size cap.
+
 ---
-```
-python CamXploit.py
-```
-Enter the **public IP address** (or `IP:PORT` format) of the target device when prompted.
 
-**Input Formats:**
-- `192.168.1.1` - Scans all common CCTV ports
-- `192.168.1.1:85` - Scans all ports + ensures port 85 is checked (useful for custom ports)
-- `192.168.1.1:9000` - Scans all ports + ensures port 9000 is checked  
+## ▶️ **Usage**
 
-### **🔍 What It Does:**  
-1️⃣ **Scans open ports** (Common CCTV ports) with service name identification  
-2️⃣ **Checks if a camera is present**  
-3️⃣ If a camera is found, it:  
-   - Searches for **login pages**  
-   - Tests **RTSP credentials** (prioritized) and **HTTP credentials**  
-   - Identifies **camera brand & vulnerabilities**  
-   - **Suggests RTSP URLs** for detected brands  
-   - Detects **live streams** (RTSP, RTMP, HTTP, MMS) with viewing instructions  
-   - Provides **location information** with maps  
-   - Shows **service names** and authentication types  
-4️⃣ Provides **manual search URLs** for deeper investigation  
+### Quick start
+
+```bash
+# Recon only (safe default — no login attempts)
+python CamXploit.py 192.168.1.10
+
+# Recon + credential brute-force (requires you to assert authorisation)
+python CamXploit.py 192.168.1.10 --i-have-authorisation
+
+# Non-interactive, scan a specific port, no third-party lookups
+python CamXploit.py 192.168.1.10:8081 --yes --no-osint
+```
+
+If you omit the target, the tool falls back to an interactive prompt.
+
+### CLI flags
+
+| Flag | Purpose |
+|---|---|
+| `target` | IPv4 or `IPv4:PORT`. IPv6 targets are rejected in this version. |
+| `--i-have-authorisation` | You assert written authorisation for the target. **Required** to enable credential brute-force against RTSP or HTTP. Without it, the scanner performs recon only. |
+| `--no-brute` | Skip credential testing even if `--i-have-authorisation` is set. |
+| `--no-osint` | Skip third-party lookups (`ipinfo.io`, Shodan/Censys/Zoomeye link output). Auto-enabled for private / loopback / link-local / multicast targets. |
+| `--threads N` | Concurrency for the port scan (default: 100, max: 500). |
+| `--yes` | Answer "yes" to the interactive "no camera found, keep going?" prompt. Use in scripted runs. |
+
+### Input formats
+
+- `192.168.1.1` — Scans all common CCTV ports.
+- `192.168.1.1:85` — Scans all common ports + ensures port 85 is included.
+- `192.168.1.1:9000` — Scans all common ports + ensures port 9000 is included.
+
+### **🔍 What It Does**
+
+1️⃣ **Scans open ports** (common CCTV ports) with active RTSP probing and service-name identification.
+2️⃣ **Checks if a camera is present** based on server headers, content types, DVR/NVR keywords, and login-form shape.
+3️⃣ If a camera is found:
+   - Searches for **login pages**.
+   - **(with `--i-have-authorisation`)** tests **RTSP credentials** (`DESCRIBE` with Basic + Digest, prioritised) and **HTTP credentials**.
+   - Identifies **camera brand & CVE cross-references**.
+   - **Suggests RTSP URLs** for detected brands.
+   - Detects **live streams** (RTSP via native socket check; RTMP/MMS via TCP reachability; HTTP/HTTPS via content-type sniff) with viewing instructions.
+   - Provides **location information** with maps (public IPs only).
+   - Shows **service names** and authentication types.
+4️⃣ Provides **manual search URLs** for deeper investigation.
 
 ---
 
 ## ⚡ Usage Tips
-- Scanning all ports (1000+) may take several minutes, depending on your network and target.
-- The tool uses multi-threading for port, login, and password checks for speed.
-- If you see "No camera found" but you know a camera is present, check the open ports and look for custom ports in the output.
-- For best results, run as administrator/root to avoid local firewall issues.
-- **RTSP ports are prioritized for credential testing** (most important for CCTV cameras)
-- **RTSP links are shown prominently** - use VLC Media Player to test them
-- **HTTP/HTTPS streams can be opened directly** in your web browser
-- **Credential testing has a 2-minute timeout** to prevent hanging
-- **Service names help identify** what's running on each port
-- **Use IP:PORT format** if you know a specific port (e.g., `192.168.1.1:85`) - ensures that port is scanned even if not in common ports list
-- **Custom ports are automatically included** when using IP:PORT format
+- Scanning ~700 ports may take a few minutes depending on your network and the target's response latency. All checks run in a `ThreadPoolExecutor`, so a single slow port no longer stalls the batch.
+- **Credential testing is off by default.** Pass `--i-have-authorisation` to enable it — the tool refuses to attempt logins otherwise.
+- If you see "No camera found" but you know a camera is present, check the open-port list for custom ports; add them with `IP:PORT` on the command line.
+- Run as administrator/root to avoid local firewall / raw-socket limitations.
+- **RTSP ports are prioritised for credential testing** — the tool sends `DESCRIBE` with Basic + Digest support, not just `OPTIONS`.
+- **RTSP links are shown prominently** — use VLC (`Media → Open Network Stream`) to test them.
+- **HTTP/HTTPS streams can be opened directly** in your browser.
+- **Credential testing has a 2-minute total budget** to prevent runaway scans.
+- **`IP:PORT`** ensures that specific port is included even if it isn't in the common-ports list.
 
 ---
 

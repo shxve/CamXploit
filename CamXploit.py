@@ -13,6 +13,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+from requests.adapters import HTTPAdapter
 from urllib3.exceptions import InsecureRequestWarning
 
 try:
@@ -262,6 +263,26 @@ class _RuntimeConfig:
 
 CONFIG = _RuntimeConfig()
 
+
+def _make_session(pool_size=64):
+    """Shared HTTP session with connection pooling and no auto-retries.
+
+    Previous versions created a fresh TCP+TLS connection per request; against
+    a device with many ports open that's thousands of handshakes. A pooled
+    session reuses connections per (host, port).
+    """
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    adapter = HTTPAdapter(pool_connections=pool_size,
+                          pool_maxsize=pool_size,
+                          max_retries=0)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+
+SESSION = _make_session()
+
 # Curated CVE database — only entries manually verified against NVD for the
 # named vendor. Previous versions of this file listed CVE-2021-31955..31964
 # under Hikvision; those are Windows-kernel CVEs and were removed.
@@ -307,7 +328,7 @@ def get_ip_location_info(ip):
         return
     print(f"\n{C}[🌍] IP and Location Information:{W}")
     try:
-        response = requests.get(f"https://ipinfo.io/{ip}/json", timeout=TIMEOUT)
+        response = SESSION.get(f"https://ipinfo.io/{ip}/json", timeout=TIMEOUT)
         if response.status_code == 200:
             data = response.json()
             
@@ -636,7 +657,7 @@ def check_if_camera(ip, open_ports):
         The camera is untrusted; without a cap a hostile server can hand us
         an unbounded body and OOM the scanner.
         """
-        with requests.get(url, headers=HEADERS, timeout=TIMEOUT,
+        with SESSION.get(url, headers=HEADERS, timeout=TIMEOUT,
                           verify=False, stream=True) as resp:
             buf = bytearray()
             for chunk in resp.iter_content(chunk_size=8192):
@@ -709,7 +730,7 @@ def check_if_camera(ip, open_ports):
             for endpoint in endpoints:
                 try:
                     endpoint_url = f"{base_url}{endpoint}"
-                    endpoint_response = requests.head(endpoint_url, headers=HEADERS,
+                    endpoint_response = SESSION.head(endpoint_url, headers=HEADERS,
                                                      timeout=TIMEOUT, verify=False,
                                                      allow_redirects=False)
                     code = endpoint_response.status_code
@@ -772,44 +793,34 @@ def check_if_camera(ip, open_ports):
 
 def check_login_pages(ip, open_ports):
     print(f"\n[🔍] {C}Checking for authentication pages:{W}")
-    found_urls = []
-    lock = threading.Lock()
-    
+
     def check_endpoint(port, path):
+        if not threads_running:
+            return None
         protocol = get_protocol(port, ip)
         url = f"{protocol}://{ip}:{port}{path}"
         try:
-            response = requests.head(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
-            if response.status_code in [200, 401, 403]:
-                with lock:
-                    found_urls.append(url)
-                    print(f"  ✅ Found login page: {url} (HTTP {response.status_code})")
-                return url
+            response = SESSION.head(url, timeout=TIMEOUT, verify=False,
+                                    allow_redirects=False)
+            if response.status_code in (200, 401, 403):
+                return (url, response.status_code)
         except (requests.exceptions.RequestException, Exception):
             pass
         return None
 
-    # Use threading for faster checking
-    threads = []
-    max_concurrent = 50  # Limit concurrent threads
-    
-    for port in open_ports:
-        for path in COMMON_PATHS:
-            thread = threading.Thread(target=check_endpoint, args=(port, path))
-            thread.daemon = True
-            threads.append(thread)
-            thread.start()
-            
-            # Limit concurrent threads to avoid overwhelming
-            if len(threads) >= max_concurrent:
-                for t in threads:
-                    t.join()
-                threads = []
-    
-    # Wait for remaining threads
-    for thread in threads:
-        thread.join()
-    
+    tasks = [(port, path) for port in open_ports for path in COMMON_PATHS]
+    found_urls = []
+    with ThreadPoolExecutor(max_workers=min(50, len(tasks) or 1)) as pool:
+        futures = [pool.submit(check_endpoint, port, path) for port, path in tasks]
+        for future in as_completed(futures):
+            if not threads_running:
+                break
+            result = future.result()
+            if result:
+                url, code = result
+                found_urls.append(url)
+                print(f"  ✅ Found login page: {url} (HTTP {code})")
+
     if not found_urls:
         print("  ❌ No authentication pages detected")
     else:
@@ -885,235 +896,155 @@ def test_rtsp_credentials(ip, port, username, password, path="/"):
     resp = _rtsp_request(ip, port, "DESCRIBE", path=path, headers=headers)
     return _rtsp_status(resp) == 200
 
+PRIORITY_CREDENTIALS = [
+    ("admin", "admin"), ("admin", "1234"), ("admin", "12345"),
+    ("admin", "123456"), ("admin", "password"), ("admin", ""),
+    ("admin", "admin123"), ("admin", "888888"), ("admin", "666666"),
+    ("root", "root"), ("root", "toor"), ("root", "1234"),
+    ("admin", "1111"), ("admin", "0000"), ("admin", "8888"),
+    ("user", "user"), ("guest", "guest"),
+]
+
+RTSP_PORTS_LIST = [554, 8554, 10554, 5554, 7070, 8555]
+WEB_PORTS = [80, 443, 8080, 8443, 8000, 8001, 8008, 8081, 8082, 8888, 9000]
+
+MAX_CREDENTIAL_TEST_TIME = 120   # total wall-clock budget across the whole call
+CREDENTIAL_TIMEOUT = 2           # per-request timeout
+_MAX_WEB_PORTS = 10              # cap for web-port breadth; logged when exceeded
+
+
 def test_default_passwords(ip, open_ports, rtsp_ports=None):
     print(f"\n[🔑] {C}Testing common credentials:{W}")
-    found = False
-    lock = threading.Lock()
-    start_time = time.time()
-    MAX_CREDENTIAL_TEST_TIME = 120  # Maximum 2 minutes total for credential testing
-    CREDENTIAL_TIMEOUT = 2  # Reduced timeout per request (2 seconds instead of 5)
-    
-    if rtsp_ports is None:
-        rtsp_ports = []
-    
-    # Prioritized list of most common credentials (test these first)
-    # Format: (username, password)
-    PRIORITY_CREDENTIALS = [
-        ("admin", "admin"),
-        ("admin", "1234"),
-        ("admin", "12345"),
-        ("admin", "123456"),
-        ("admin", "password"),
-        ("admin", ""),  # Empty password
-        ("admin", "admin123"),
-        ("admin", "888888"),
-        ("admin", "666666"),
-        ("root", "root"),
-        ("root", "toor"),
-        ("root", "1234"),
-        ("admin", "1111"),
-        ("admin", "0000"),
-        ("admin", "8888"),
-        ("user", "user"),
-        ("guest", "guest"),
-    ]
-    
-    # Include RTSP ports (MOST IMPORTANT for CCTV!) and web ports
-    RTSP_PORTS_LIST = [554, 8554, 10554, 5554, 7070, 8555]  # Common RTSP ports
-    WEB_PORTS = [80, 443, 8080, 8443, 8000, 8001, 8008, 8081, 8082, 8888, 9000]
-    
-    # Prioritize RTSP ports - they're the most important for CCTV cameras!
-    ports_to_test = []
-    
-    # First add RTSP ports (detected + standard)
-    all_rtsp_ports = set(rtsp_ports) | set([p for p in open_ports if p in RTSP_PORTS_LIST])
-    ports_to_test.extend(sorted(all_rtsp_ports))
-    
-    # Then add web ports
-    web_ports = [p for p in open_ports if p in WEB_PORTS or (p < 10000 and p not in all_rtsp_ports)]
-    ports_to_test.extend(web_ports[:10])  # Limit web ports to first 10
-    
-    if not ports_to_test:
+
+    rtsp_ports = rtsp_ports or []
+    all_rtsp_ports = sorted(set(rtsp_ports) | {p for p in open_ports if p in RTSP_PORTS_LIST})
+    web_ports_all = [p for p in open_ports
+                     if p in WEB_PORTS or (p < 10000 and p not in all_rtsp_ports)]
+    web_ports = web_ports_all[:_MAX_WEB_PORTS]
+    if len(web_ports_all) > _MAX_WEB_PORTS:
+        print(f"{Y}[ℹ️] {len(web_ports_all) - _MAX_WEB_PORTS} web port(s) dropped "
+              f"(cap {_MAX_WEB_PORTS}). Raise _MAX_WEB_PORTS to widen.{W}")
+
+    if not all_rtsp_ports and not web_ports:
         print(f"{Y}[ℹ️] No ports found for credential testing{W}")
         return
-    
-    rtsp_count = len(all_rtsp_ports)
-    web_count = len(web_ports[:10])
-    print(f"{Y}[ℹ️] Testing credentials on {rtsp_count} RTSP port(s) + {web_count} web port(s)...{W}")
-    if rtsp_count > 0:
-        print(f"{C}[🎯] RTSP ports are prioritized (most important for CCTV cameras!){W}")
-    
-    tested_count = [0]  # Track number of credentials tested
-    
-    def test_http_credentials(protocol, port, path, auth_type, credentials_list):
-        """Test HTTP/HTTPS credentials"""
-        nonlocal found
-        if found:
-            return False
-        
-        if time.time() - start_time > MAX_CREDENTIAL_TEST_TIME:
-            return False
-            
-        url = f"{protocol}://{ip}:{port}{path}"
-        for username, password in credentials_list:
-            if found or (time.time() - start_time > MAX_CREDENTIAL_TEST_TIME):
-                return False
-            
-            with lock:
-                tested_count[0] += 1
-                if tested_count[0] % 20 == 0:
-                    elapsed = int(time.time() - start_time)
-                    print(f"  📊 Tested {tested_count[0]} credentials... ({elapsed}s elapsed)")
-            
-            try:
-                if auth_type == "basic":
-                    response = requests.get(url, auth=(username, password), 
-                                        headers=HEADERS, timeout=CREDENTIAL_TIMEOUT, verify=False)
-                elif auth_type == "form":
-                    response = requests.post(url, data={'username': username, 'password': password},
-                                            headers=HEADERS, timeout=CREDENTIAL_TIMEOUT, verify=False)
-                
-                if response.status_code == 200:
-                    with lock:
-                        if not found:
-                            found = True
-                            print(f"🔥 Success! {username}:{password} @ {url}")
-                    return True
-            except requests.exceptions.Timeout:
-                continue
-            except requests.exceptions.RequestException:
-                continue
-            except Exception:
-                pass
-        return False
-    
-    def test_rtsp_credentials_thread(port, credentials_list):
-        """Test RTSP credentials in a thread"""
-        nonlocal found
-        if found:
-            return False
-        
-        if time.time() - start_time > MAX_CREDENTIAL_TEST_TIME:
-            return False
-        
-        for username, password in credentials_list:
-            if found or (time.time() - start_time > MAX_CREDENTIAL_TEST_TIME):
-                return False
-            
-            with lock:
-                tested_count[0] += 1
-                if tested_count[0] % 20 == 0:
-                    elapsed = int(time.time() - start_time)
-                    print(f"  📊 Tested {tested_count[0]} credentials... ({elapsed}s elapsed)")
-            
-            if test_rtsp_credentials(ip, port, username, password):
-                with lock:
-                    if not found:
-                        found = True
-                        print(f"🔥 Success! RTSP {username}:{password} @ rtsp://{ip}:{port}/")
-                return True
-        return False
 
-    # Test endpoints with threading
-    threads = []
-    max_concurrent = 30
-    THREAD_JOIN_TIMEOUT = 5
-    
-    # PRIORITY 1: Test RTSP ports first (MOST IMPORTANT!)
-    for port in sorted(all_rtsp_ports):
-        if found or (time.time() - start_time > MAX_CREDENTIAL_TEST_TIME):
-            break
-        
-        # Test RTSP credentials
-        thread = threading.Thread(target=test_rtsp_credentials_thread, args=(port, PRIORITY_CREDENTIALS))
-        thread.daemon = True
-        threads.append(thread)
-        thread.start()
-        
-        if len(threads) >= max_concurrent:
-            for t in threads:
-                t.join(timeout=THREAD_JOIN_TIMEOUT)
-            threads = []
-    
-    # PRIORITY 2: Test HTTP/HTTPS credentials on web ports
-    endpoints = [
-        ("/", "basic"),  # Most common - HTTP Basic Auth
-        ("/login", "form"),  # Common login form
-    ]
-    
-    for port in web_ports[:10]:
-        if found or (time.time() - start_time > MAX_CREDENTIAL_TEST_TIME):
-            break
+    print(f"{Y}[ℹ️] Testing credentials on {len(all_rtsp_ports)} RTSP port(s) + "
+          f"{len(web_ports)} web port(s)...{W}")
+    if all_rtsp_ports:
+        print(f"{C}[🎯] RTSP ports are prioritized (most important for CCTV cameras!){W}")
+
+    start_time = time.time()
+    found_event = threading.Event()   # cross-thread "stop" flag
+    lock = threading.Lock()
+    tested_count = [0]
+    successes = []
+
+    def _time_left():
+        return MAX_CREDENTIAL_TEST_TIME - (time.time() - start_time)
+
+    def _bump(kind, label):
+        with lock:
+            tested_count[0] += 1
+            if tested_count[0] % 20 == 0:
+                print(f"  📊 Tested {tested_count[0]} credentials... "
+                      f"({int(time.time() - start_time)}s elapsed) [{kind} {label}]")
+
+    def _rtsp_task(port, username, password):
+        if found_event.is_set() or _time_left() <= 0 or not threads_running:
+            return None
+        _bump("RTSP", port)
+        if test_rtsp_credentials(ip, port, username, password):
+            return ("rtsp", port, None, username, password)
+        return None
+
+    def _http_task(port, path, auth_type, username, password):
+        if found_event.is_set() or _time_left() <= 0 or not threads_running:
+            return None
+        _bump("HTTP", port)
         protocol = get_protocol(port, ip)
-        
-        for path, auth_type in endpoints:
-            if found or (time.time() - start_time > MAX_CREDENTIAL_TEST_TIME):
-                break
-            
-            thread = threading.Thread(target=test_http_credentials, args=(protocol, port, path, auth_type, PRIORITY_CREDENTIALS))
-            thread.daemon = True
-            threads.append(thread)
-            thread.start()
-            
-            if len(threads) >= max_concurrent:
-                for t in threads:
-                    t.join(timeout=THREAD_JOIN_TIMEOUT)
-                threads = []
-    
-    # Wait for priority credentials to finish
-    for thread in threads:
-        thread.join(timeout=THREAD_JOIN_TIMEOUT)
-    threads = []
-    
-    # If not found, test remaining credentials (but only if we have time)
-    if not found and (time.time() - start_time < MAX_CREDENTIAL_TEST_TIME * 0.7):
-        # Flatten all credentials for remaining tests
-        all_credentials = []
-        for username, passwords in DEFAULT_CREDENTIALS.items():
-            for password in passwords:
-                if (username, password) not in PRIORITY_CREDENTIALS:
-                    all_credentials.append((username, password))
-        
-        # Test remaining RTSP credentials
-        for port in sorted(all_rtsp_ports)[:3]:  # Only first 3 RTSP ports
-            if found or (time.time() - start_time > MAX_CREDENTIAL_TEST_TIME):
-                break
-            thread = threading.Thread(target=test_rtsp_credentials_thread, args=(port, all_credentials[:30]))
-            thread.daemon = True
-            threads.append(thread)
-            thread.start()
-            
-            if len(threads) >= max_concurrent:
-                for t in threads:
-                    t.join(timeout=THREAD_JOIN_TIMEOUT)
-                threads = []
-        
-        # Test remaining HTTP credentials on fewer ports
+        url = f"{protocol}://{ip}:{port}{path}"
+        try:
+            if auth_type == "basic":
+                response = SESSION.get(url, auth=(username, password),
+                                       timeout=CREDENTIAL_TIMEOUT, verify=False,
+                                       allow_redirects=False)
+            elif auth_type == "form":
+                response = SESSION.post(url, data={'username': username, 'password': password},
+                                        timeout=CREDENTIAL_TIMEOUT, verify=False,
+                                        allow_redirects=False)
+            else:
+                return None
+            if response.status_code == 200:
+                return ("http", port, url, username, password)
+        except (requests.exceptions.RequestException, Exception):
+            pass
+        return None
+
+    def _run_batch(tasks):
+        """Submit `tasks` to a pool; drain as_completed until success or budget out."""
+        if not tasks:
+            return
+        with ThreadPoolExecutor(max_workers=30) as pool:
+            futures = [pool.submit(fn, *args) for fn, args in tasks]
+            for future in as_completed(futures):
+                if found_event.is_set() or _time_left() <= 0 or not threads_running:
+                    break
+                result = future.result()
+                if result:
+                    successes.append(result)
+                    found_event.set()
+                    break
+
+    # PRIORITY 1: RTSP + web with the short PRIORITY_CREDENTIALS list.
+    priority_tasks = []
+    for port in all_rtsp_ports:
+        for u, p in PRIORITY_CREDENTIALS:
+            priority_tasks.append((_rtsp_task, (port, u, p)))
+    endpoints = [("/", "basic"), ("/login", "form")]
+    for port in web_ports:
+        for path, auth in endpoints:
+            for u, p in PRIORITY_CREDENTIALS:
+                priority_tasks.append((_http_task, (port, path, auth, u, p)))
+    _run_batch(priority_tasks)
+
+    # PRIORITY 2: remaining creds, tighter port set, only if we have >30% budget left.
+    if not found_event.is_set() and _time_left() > MAX_CREDENTIAL_TEST_TIME * 0.3:
+        priority_set = set(PRIORITY_CREDENTIALS)
+        extra_credentials = [
+            (u, p)
+            for u, ps in DEFAULT_CREDENTIALS.items()
+            for p in ps
+            if (u, p) not in priority_set
+        ][:30]
+        if len(extra_credentials) == 30:
+            total_extra = sum(len(ps) for ps in DEFAULT_CREDENTIALS.values()) - len(priority_set)
+            if total_extra > 30:
+                print(f"{Y}[ℹ️] {total_extra - 30} extra credential(s) dropped "
+                      f"(round-2 cap 30).{W}")
+
+        follow_tasks = []
+        for port in all_rtsp_ports[:3]:
+            for u, p in extra_credentials:
+                follow_tasks.append((_rtsp_task, (port, u, p)))
         for port in web_ports[:3]:
-            if found or (time.time() - start_time > MAX_CREDENTIAL_TEST_TIME):
-                break
-            protocol = get_protocol(port, ip)
-            thread = threading.Thread(target=test_http_credentials, args=(protocol, port, "/", "basic", all_credentials[:30]))
-            thread.daemon = True
-            threads.append(thread)
-            thread.start()
-            
-            if len(threads) >= max_concurrent:
-                for t in threads:
-                    t.join(timeout=THREAD_JOIN_TIMEOUT)
-                threads = []
-    
-    # Wait for remaining threads
-    for thread in threads:
-        thread.join(timeout=THREAD_JOIN_TIMEOUT)
-    
-    elapsed_time = time.time() - start_time
-    if elapsed_time >= MAX_CREDENTIAL_TEST_TIME:
+            for u, p in extra_credentials:
+                follow_tasks.append((_http_task, (port, "/", "basic", u, p)))
+        _run_batch(follow_tasks)
+
+    elapsed = int(time.time() - start_time)
+    if _time_left() <= 0:
         print(f"{Y}[⚠️] Credential testing stopped after {MAX_CREDENTIAL_TEST_TIME}s timeout{W}")
     else:
-        print(f"{C}[✓] Tested {tested_count[0]} credentials in {int(elapsed_time)}s{W}")
-    
-    if not found:
+        print(f"{C}[✓] Tested {tested_count[0]} credentials in {elapsed}s{W}")
+
+    if successes:
+        for kind, port, url, user, pw in successes:
+            if kind == "rtsp":
+                print(f"🔥 Success! RTSP {user}:{pw} @ rtsp://{ip}:{port}/")
+            else:
+                print(f"🔥 Success! {user}:{pw} @ {url}")
+    else:
         print("❌ No default credentials found")
 
 def try_default_credentials(ip, port):
@@ -1129,7 +1060,7 @@ def try_default_credentials(ip, port):
     for username, passwords in DEFAULT_CREDENTIALS.items():
         for password in passwords:
             try:
-                response = requests.get(base, auth=(username, password),
+                response = SESSION.get(base, auth=(username, password),
                                         headers=HEADERS, timeout=TIMEOUT, verify=False)
                 if response.status_code == 200:
                     return f"{username}:{password}"
@@ -1153,7 +1084,7 @@ def fingerprint_camera(ip, open_ports):
         url_base = f"{protocol}://{ip}:{port}"
         print(f"🔍 Checking {url_base}...")
         try:
-            resp = requests.get(url_base, headers=HEADERS, timeout=TIMEOUT, verify=False)
+            resp = SESSION.get(url_base, headers=HEADERS, timeout=TIMEOUT, verify=False)
             server_header = resp.headers.get("server", "").lower()
             content = resp.text.lower()
             
@@ -1195,7 +1126,7 @@ def fingerprint_hikvision(ip, port):
 
     for url in endpoints:
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
+            resp = SESSION.get(url, headers=HEADERS, timeout=TIMEOUT,
                                 verify=False, auth=auth, stream=True)
             if resp.status_code == 401:
                 print(f"⚠️ Authentication required for {url}")
@@ -1229,7 +1160,7 @@ def fingerprint_dahua(ip, port):
     protocol = get_protocol(port, ip)
     try:
         url = f"{protocol}://{ip}:{port}/cgi-bin/magicBox.cgi?action=getSystemInfo"
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+        resp = SESSION.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
         if resp.status_code == 200:
             print(f"✅ Found at {url}")
             print(resp.text.strip())
@@ -1244,7 +1175,7 @@ def fingerprint_axis(ip, port):
     protocol = get_protocol(port, ip)
     try:
         url = f"{protocol}://{ip}:{port}/axis-cgi/admin/param.cgi?action=list"
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+        resp = SESSION.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
         if resp.status_code == 200:
             print(f"✅ Found at {url}")
             for line in resp.text.splitlines():
@@ -1273,7 +1204,7 @@ def fingerprint_cp_plus(ip, port):
     
     for url in endpoints:
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+            resp = SESSION.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
             if resp.status_code == 200:
                 print(f"✅ Found at {url}")
                 content = resp.text.lower()
@@ -1320,7 +1251,7 @@ def fingerprint_generic(ip, port):
     for path in endpoints:
         url = f"{protocol}://{ip}:{port}{path}"
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+            resp = SESSION.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
             if resp.status_code == 200:
                 print(f"✅ Found at {url}")
                 snippet = resp.text[:500]
@@ -1339,57 +1270,6 @@ def fingerprint_generic(ip, port):
     if not detected_brand:
         print("❌ No common endpoints responded.")
 
-def check_stream(url):
-    """Enhanced stream detection with multiple methods"""
-    try:
-        # Method 1: Try HEAD request first
-        response = requests.head(url, timeout=TIMEOUT, verify=False)
-        if response.status_code == 200:
-            # Check content type for video/stream indicators
-            content_type = response.headers.get('Content-Type', '').lower()
-            if any(x in content_type for x in ['video', 'stream', 'mpeg', 'h264', 'mjpeg', 'rtsp', 'rtmp']):
-                return True
-            # Check for common video file extensions in URL
-            if any(x in url.lower() for x in ['.mp4', '.m3u8', '.ts', '.flv', '.webm']):
-                return True
-            # Check for streaming protocols in URL
-            if any(x in url.lower() for x in ['rtsp://', 'rtmp://', 'mms://']):
-                return True
-        
-        # Method 2: Try GET request for better detection
-        response = requests.get(url, timeout=TIMEOUT, verify=False, stream=True)
-        if response.status_code == 200:
-            # Check content type
-            content_type = response.headers.get('Content-Type', '').lower()
-            if any(x in content_type for x in ['video', 'stream', 'mpeg', 'h264', 'mjpeg', 'rtsp', 'rtmp', 'image']):
-                return True
-            
-            # Check for video file extensions in URL
-            if any(x in url.lower() for x in ['.mp4', '.m3u8', '.ts', '.flv', '.webm', '.avi', '.mov']):
-                return True
-            
-            # Check for streaming protocols in URL
-            if any(x in url.lower() for x in ['rtsp://', 'rtmp://', 'mms://', 'rtp://']):
-                return True
-            
-            # Check response content for stream indicators
-            try:
-                content = response.text.lower()
-                if any(x in content for x in ['stream', 'video', 'live', 'camera', 'mjpg', 'mpeg']):
-                    return True
-            except (UnicodeDecodeError, AttributeError):
-                pass
-        
-        # Method 3: Check for specific camera stream patterns
-        if any(x in url.lower() for x in ['/video', '/stream', '/live', '/mjpg', '/snapshot']):
-            return True
-            
-    except requests.exceptions.RequestException:
-        pass
-    except Exception as e:
-        pass
-    return False
-
 def detect_camera_brand(ip, open_ports):
     """Detect camera brand from HTTP responses"""
     detected_brands = set()
@@ -1407,7 +1287,7 @@ def detect_camera_brand(ip, open_ports):
         try:
             protocol = get_protocol(port, ip)
             url = f"{protocol}://{ip}:{port}/"
-            response = requests.get(url, headers=HEADERS, timeout=2, verify=False)
+            response = SESSION.get(url, headers=HEADERS, timeout=2, verify=False)
             
             if response.status_code == 200:
                 content = response.text.lower()
@@ -1560,7 +1440,7 @@ def detect_live_streams(ip, open_ports, rtsp_ports=None):
         lower = url.lower()
         try:
             # verify=False: cameras almost always ship self-signed certs
-            with requests.get(url, timeout=TIMEOUT, verify=False,
+            with SESSION.get(url, timeout=TIMEOUT, verify=False,
                               stream=True, headers=HEADERS) as response:
                 if response.status_code != 200:
                     return False
@@ -1643,94 +1523,41 @@ def detect_live_streams(ip, open_ports, rtsp_ports=None):
             return _check_socket_stream(url, 'mms')
         return False
     
-    # Check all ports for streams with threading
-    threads = []
-    max_concurrent = 30
-    
-    # Check RTSP streams on ALL detected RTSP ports (including non-standard ports)
-    rtsp_ports_to_check = set(rtsp_ports) | set(streaming_ports['rtsp'])  # Combine detected RTSP ports with standard ones
-    
+    # Build the full URL work-list first, then hand it to a pool. This
+    # replaces five separate batch-of-30 thread loops (each of which
+    # blocked on `.join()` before starting the next batch) with a single
+    # ThreadPoolExecutor that keeps 30 slots hot for the whole scan.
+    rtsp_ports_to_check = set(rtsp_ports) | set(streaming_ports['rtsp'])
+    urls_to_check = []
+
     for port in open_ports:
-        # Check RTSP streams on ALL RTSP-detected ports (not just standard port 554)
         if port in rtsp_ports_to_check:
-            for path in stream_paths['rtsp']:
-                url = f"rtsp://{ip}:{port}{path}"
-                thread = threading.Thread(target=lambda u=url: check_stream_with_details(u) or None)
-                thread.daemon = True
-                threads.append(thread)
-                thread.start()
-                found_streams = True
-                
-                if len(threads) >= max_concurrent:
-                    for t in threads:
-                        t.join()
-                    threads = []
-        
-        # Check RTMP streams
+            urls_to_check.extend(f"rtsp://{ip}:{port}{path}" for path in stream_paths['rtsp'])
         if port in streaming_ports['rtmp']:
-            for path in stream_paths['rtmp']:
-                url = f"rtmp://{ip}:{port}{path}"
-                thread = threading.Thread(target=lambda u=url: check_stream_with_details(u) or None)
-                thread.daemon = True
-                threads.append(thread)
-                thread.start()
-                found_streams = True
-                
-                if len(threads) >= max_concurrent:
-                    for t in threads:
-                        t.join()
-                    threads = []
-        
-        # Check HTTP/HTTPS streams
+            urls_to_check.extend(f"rtmp://{ip}:{port}{path}" for path in stream_paths['rtmp'])
         if port in streaming_ports['http'] + streaming_ports['https']:
             protocol = 'https' if port in streaming_ports['https'] else 'http'
-            for path in stream_paths['http']:
-                url = f"{protocol}://{ip}:{port}{path}"
-                thread = threading.Thread(target=lambda u=url: check_stream_with_details(u) or None)
-                thread.daemon = True
-                threads.append(thread)
-                thread.start()
-                found_streams = True
-                
-                if len(threads) >= max_concurrent:
-                    for t in threads:
-                        t.join()
-                    threads = []
-        
-        # Check MMS streams
+            urls_to_check.extend(f"{protocol}://{ip}:{port}{path}" for path in stream_paths['http'])
         if port in streaming_ports['mms']:
-            url = f"mms://{ip}:{port}"
-            thread = threading.Thread(target=lambda u=url: check_stream_with_details(u) or None)
-            thread.daemon = True
-            threads.append(thread)
-            thread.start()
-            found_streams = True
-            
-            if len(threads) >= max_concurrent:
-                for t in threads:
-                    t.join()
-                threads = []
-        
-        # Check ONVIF streams
+            urls_to_check.append(f"mms://{ip}:{port}")
         if port in streaming_ports['onvif']:
-            url = f"http://{ip}:{port}/onvif/device_service"
-            thread = threading.Thread(target=lambda u=url: check_stream_with_details(u) or None)
-            thread.daemon = True
-            threads.append(thread)
-            thread.start()
-            found_streams = True
-            
-            if len(threads) >= max_concurrent:
-                for t in threads:
-                    t.join()
-                threads = []
-    
-    # Wait for remaining threads with timeout
-    for thread in threads:
-        thread.join(timeout=10)  # Add timeout to prevent hanging
-    
-    # Small delay to ensure all output is flushed
-    time.sleep(0.5)
+            urls_to_check.append(f"http://{ip}:{port}/onvif/device_service")
+
+    if urls_to_check:
+        with ThreadPoolExecutor(max_workers=30) as pool:
+            futures = [pool.submit(check_stream_with_details, url) for url in urls_to_check]
+            for future in as_completed(futures):
+                if not threads_running:
+                    break
+                # `check_stream_with_details` already prints on success; here we
+                # only need to track whether ANY confirmed a stream (fixes the
+                # old bug of marking found_streams=True just because a check
+                # was started, regardless of the result).
+                try:
+                    if future.result():
+                        found_streams = True
+                except Exception:
+                    pass
     
     if not found_streams:
         print("  ❌ No live streams detected")
