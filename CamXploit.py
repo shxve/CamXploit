@@ -59,7 +59,7 @@ BANNER = rf"""
   {C}[🔍] Discover open CCTV cameras & security flaws
   {Y}[⚠️] For educational & security research purposes only!{W}
 
-  {B}VERSION{W}  = 2.0.2
+  {B}VERSION{W}  = 2.1
   {B}Made By{W}  = Spyboy
   {B}Twitter{W}  = https://spyboy.in/twitter
   {B}Discord{W}  = https://spyboy.in/Discord
@@ -627,7 +627,10 @@ def check_ports(ip, additional_ports=None):
         for future in as_completed(pool.submit(scan_port, p) for p in ports_to_scan):
             if not threads_running:
                 break
-            port, is_open, is_rtsp = future.result()
+            try:
+                port, is_open, is_rtsp = future.result()
+            except Exception:
+                continue
             with lock:
                 scanned_count += 1
                 if is_open:
@@ -837,7 +840,10 @@ def check_login_pages(ip, open_ports):
         for future in as_completed(futures):
             if not threads_running:
                 break
-            result = future.result()
+            try:
+                result = future.result()
+            except Exception:
+                continue
             if result:
                 url, code = result
                 found_urls.append(url)
@@ -1068,7 +1074,10 @@ def test_default_passwords(ip, open_ports, rtsp_ports=None):
             for future in as_completed(futures):
                 if found_event.is_set() or _time_left() <= 0 or not threads_running:
                     break
-                result = future.result()
+                try:
+                    result = future.result()
+                except Exception:
+                    continue
                 if result:
                     successes.append(result)
                     found_event.set()
@@ -1788,6 +1797,10 @@ def main(argv=None):
         print("\n[!] Scan aborted by user")
         threads_running = False
         return 130
+    except Exception as e:
+        print(f"\n{R}[!] Unexpected error during scan: {e}{W}")
+        threads_running = False
+        return 1
 
 
 if __name__ == "__main__":
