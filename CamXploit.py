@@ -978,6 +978,13 @@ _MAX_WEB_PORTS = 10              # cap for web-port breadth; logged when exceede
 
 
 def test_default_passwords(ip, open_ports, rtsp_ports=None):
+    # Defense in depth: never brute-force credentials unless the operator has
+    # asserted authorisation. main() already gates this call, but guarding here
+    # keeps the function safe if it is ever reused directly (e.g. as a library).
+    if not CONFIG.authorised or CONFIG.no_brute:
+        print(f"\n{C}[🔒] Skipping credential testing (authorisation not asserted or --no-brute).{W}")
+        return
+
     print(f"\n[🔑] {C}Testing common credentials:{W}")
 
     rtsp_ports = rtsp_ports or []
@@ -1186,6 +1193,17 @@ def try_default_credentials(ip, port):
         return None
     protocol = get_protocol(port, ip)
     base = f"{protocol}://{ip}:{port}/"
+
+    # Only meaningful if the endpoint actually enforces auth. If an
+    # unauthenticated GET already returns 200, every credential would appear to
+    # "succeed" — the same false positive guarded against in _http_task.
+    try:
+        unauth, _ = _capped_get(base, cap=1)
+    except Exception:
+        return None
+    if unauth.status_code not in (401, 403):
+        return None
+
     for username, passwords in DEFAULT_CREDENTIALS.items():
         for password in passwords:
             try:
