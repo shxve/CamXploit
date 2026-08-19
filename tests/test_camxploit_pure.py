@@ -112,21 +112,22 @@ class DigestResponseTests(unittest.TestCase):
 
     def test_non_qop_matches_rfc_formula(self):
         challenge = {"realm": self.REALM, "nonce": self.NONCE}
-        header = cx._digest_response(self.USER, self.PW, self.METHOD, self.URI, challenge)
+        header = cx._build_digest_authorization(self.USER, self.PW, self.METHOD, self.URI, challenge)
         self.assertTrue(header.startswith("Digest "))
         self.assertIn('username="admin"', header)
         self.assertIn('realm="IPCamera"', header)
         # Golden value, computed independently from the RFC 2617 formula.
+        # Identical to pwneye's golden vector — the two builders agree.
         self.assertIn('response="facffdbc0f4dc43bcb75975cfd82535b"', header)
         self.assertNotIn("qop=", header)
 
     def test_qop_auth_with_patched_cnonce(self):
         challenge = {"realm": self.REALM, "nonce": self.NONCE, "qop": "auth"}
-        fixed = b"\x00" * 8  # cnonce = md5(os.urandom(8))[:16]
+        fixed = b"\x00" * 16  # cnonce = md5(os.urandom(16))[:16]
         expected_cnonce = hashlib.md5(fixed).hexdigest()[:16]
         with mock.patch.object(cx.os, "urandom", return_value=fixed):
-            header = cx._digest_response(self.USER, self.PW, self.METHOD, self.URI, challenge)
-        self.assertIn("qop=auth", header)
+            header = cx._build_digest_authorization(self.USER, self.PW, self.METHOD, self.URI, challenge)
+        self.assertIn('qop="auth"', header)
         self.assertIn("nc=00000001", header)
         self.assertIn(f'cnonce="{expected_cnonce}"', header)
 
@@ -137,8 +138,34 @@ class DigestResponseTests(unittest.TestCase):
 
     def test_opaque_is_echoed(self):
         challenge = {"realm": self.REALM, "nonce": self.NONCE, "opaque": "cafe"}
-        header = cx._digest_response(self.USER, self.PW, self.METHOD, self.URI, challenge)
+        header = cx._build_digest_authorization(self.USER, self.PW, self.METHOD, self.URI, challenge)
         self.assertIn('opaque="cafe"', header)
+
+    def test_missing_realm_or_nonce_returns_none(self):
+        self.assertIsNone(
+            cx._build_digest_authorization("u", "p", "DESCRIBE", "/", {"nonce": "x"})
+        )
+        self.assertIsNone(
+            cx._build_digest_authorization("u", "p", "DESCRIBE", "/", {"realm": "x"})
+        )
+
+    def test_non_md5_algorithm_is_rejected(self):
+        challenge = {"realm": self.REALM, "nonce": self.NONCE, "algorithm": "SHA-256"}
+        self.assertIsNone(
+            cx._build_digest_authorization(self.USER, self.PW, self.METHOD, self.URI, challenge)
+        )
+
+    def test_unsupported_qop_token_is_rejected(self):
+        challenge = {"realm": self.REALM, "nonce": self.NONCE, "qop": "auth-int"}
+        self.assertIsNone(
+            cx._build_digest_authorization(self.USER, self.PW, self.METHOD, self.URI, challenge)
+        )
+
+    def test_auth_offered_after_auth_int_is_selected(self):
+        challenge = {"realm": self.REALM, "nonce": self.NONCE, "qop": "auth-int,auth"}
+        header = cx._build_digest_authorization(self.USER, self.PW, self.METHOD, self.URI, challenge)
+        self.assertIsNotNone(header)
+        self.assertIn('qop="auth"', header)
 
 
 class RtspResponseParsingTests(unittest.TestCase):

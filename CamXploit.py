@@ -580,39 +580,68 @@ def _parse_digest_challenge(header_val):
     return params or None
 
 
-def _digest_response(user, password, method, uri, challenge):
-    """Compute a minimal RFC 2617 Digest response header value."""
-    realm  = challenge.get("realm", "")
-    nonce  = challenge.get("nonce", "")
-    qop    = challenge.get("qop")
-    algo   = (challenge.get("algorithm") or "MD5").upper()
-    opaque = challenge.get("opaque")
+def _hash_md5(value):
+    return hashlib.md5(value.encode()).hexdigest()
 
-    def _h(s):
-        return hashlib.md5(s.encode("utf-8", "ignore")).hexdigest()
 
-    ha1 = _h(f"{user}:{realm}:{password}")
-    ha2 = _h(f"{method}:{uri}")
+def _build_digest_authorization(username, password, method, uri, params):
+    """Build an RFC 2617 Digest authorization header value (MD5, qop=auth).
+
+    Canonical digest builder: kept behaviourally identical to pwneye's
+    ``_build_digest_authorization`` (pwneye/core/network/rtsp.py) so the Horizon
+    merge can collapse the two copies into a single shared helper. Returns None
+    when the challenge is unusable (missing realm/nonce, a non-MD5 algorithm, or
+    a qop that does not offer "auth").
+    """
+    realm = params.get("realm")
+    nonce = params.get("nonce")
+
+    if not realm or not nonce:
+        return None
+
+    qop = params.get("qop")
+    opaque = params.get("opaque")
+    algorithm = params.get("algorithm", "MD5")
+
+    if algorithm.upper() != "MD5":
+        return None
+
+    ha1 = _hash_md5(f"{username}:{realm}:{password}")
+    ha2 = _hash_md5(f"{method}:{uri}")
+
+    parts = [
+        f'username="{username}"',
+        f'realm="{realm}"',
+        f'nonce="{nonce}"',
+        f'uri="{uri}"',
+        'algorithm="MD5"',
+    ]
+
     if qop:
-        # qop=auth uses cnonce + nc; single-shot values are fine here.
-        cnonce = hashlib.md5(os.urandom(8)).hexdigest()[:16]
+        # A server may offer several qop tokens (e.g. "auth,auth-int"); use
+        # "auth" whenever it is on offer. auth-int is not implemented.
+        offered = [token.strip().lower() for token in qop.split(",")]
+        if "auth" not in offered:
+            return None
+        qop_token = "auth"
+
+        cnonce = hashlib.md5(os.urandom(16)).hexdigest()[:16]
         nc = "00000001"
-        # qop may be a comma list like "auth,auth-int" — pick "auth".
-        qop_pick = "auth"
-        resp = _h(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop_pick}:{ha2}")
-        parts = [
-            f'username="{user}"', f'realm="{realm}"', f'nonce="{nonce}"',
-            f'uri="{uri}"', f'algorithm={algo}', f'response="{resp}"',
-            f'qop={qop_pick}', f'nc={nc}', f'cnonce="{cnonce}"',
-        ]
+        response = _hash_md5(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop_token}:{ha2}")
+
+        parts.extend([
+            f'response="{response}"',
+            f'qop="{qop_token}"',
+            f'nc={nc}',
+            f'cnonce="{cnonce}"',
+        ])
     else:
-        resp = _h(f"{ha1}:{nonce}:{ha2}")
-        parts = [
-            f'username="{user}"', f'realm="{realm}"', f'nonce="{nonce}"',
-            f'uri="{uri}"', f'algorithm={algo}', f'response="{resp}"',
-        ]
+        response = _hash_md5(f"{ha1}:{nonce}:{ha2}")
+        parts.append(f'response="{response}"')
+
     if opaque:
         parts.append(f'opaque="{opaque}"')
+
     return "Digest " + ", ".join(parts)
 
 def check_ports(ip, additional_ports=None):
@@ -954,7 +983,10 @@ def test_rtsp_credentials(ip, port, username, password, path="/"):
         params = _parse_digest_challenge(challenge)
         if not params:
             return False
-        headers = {"Authorization": _digest_response(username, password, "DESCRIBE", uri, params),
+        authorization = _build_digest_authorization(username, password, "DESCRIBE", uri, params)
+        if authorization is None:
+            return False
+        headers = {"Authorization": authorization,
                    "Accept": "application/sdp"}
 
     resp = _rtsp_request(ip, port, "DESCRIBE", path=path, headers=headers)
